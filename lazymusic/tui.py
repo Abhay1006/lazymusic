@@ -53,9 +53,11 @@ SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 # Bus jobs worth a spinner on the key bar; the status poll is not one of them.
 SLOW_JOBS = ("search", "tracks", "playlists", "playquery", "lyrics", "queue")
 
-FRAME = 0.2       # seconds between repaints
+FRAME = 0.2       # seconds between repaints while something is moving
+IDLE_FRAME = 1.0  # ...and while it is not, where a repaint changes nothing
 STATE_PLAYING = 1.0  # seconds between state reads while playing
 STATE_IDLE = 3.0     # ...and while paused or stopped, where nothing moves
+STATE_DOWN = 15.0    # ...and while Music.app is not running at all
 LOAD_DELAY = 0.18  # settle time before loading the highlighted playlist
 HANDOFF = 1.5      # seconds before a track ends to hand playback to the queue
 CACHE_TTL = 60.0   # seconds a cached playlist stays fresh; `R` clears it early
@@ -517,15 +519,41 @@ class App:
 
     def refresh(self, force=False):
         # Adaptive: a paused track cannot change on its own, so polling it hard
-        # just burns CPU on osascript processes. Poll briskly while playing and
-        # back off when nothing is moving.
+        # just burns CPU on osascript processes. Poll briskly while playing,
+        # back off when nothing is moving, and barely look at all once Music has
+        # been quit - a lazymusic left running in a window nobody is watching
+        # should cost close to nothing.
         now = time.monotonic()
-        gap = STATE_PLAYING if self.state.playing else STATE_IDLE
+        if not self.state.running:
+            gap = STATE_DOWN
+        elif self.state.playing:
+            gap = STATE_PLAYING
+        else:
+            gap = STATE_IDLE
         if not force and now - self._last_state < gap:
             return
         self._last_state = now
-        self.bus.submit("status", lambda: music.status(autolaunch=True),
+        # Only a forced refresh may start Music.app, and those come from startup
+        # and from acting on a keypress - both asked for. The periodic poll must
+        # never launch it: quitting Music with lazymusic still open somewhere
+        # would otherwise bring it straight back, over and over.
+        self.bus.submit("status", lambda: music.status(autolaunch=force),
                         self._got_status)
+
+    def frame_delay(self):
+        """How long to wait for a keypress before building the next frame.
+
+        Only a playing track changes the screen by itself - the clock and the
+        bar move with no one asking. Everything else waits for input, so an idle
+        player can tick once a second instead of laying out the whole frame five
+        times a second for hours. `select` still returns the moment a key
+        arrives, so nothing feels slower; only the empty wake-ups go away.
+        """
+        if self.state.playing or self.bus.busy or self._pending:
+            return FRAME
+        if time.monotonic() < self.message_until:
+            return FRAME
+        return IDLE_FRAME
 
     def _got_status(self, state, err):
         if err:
@@ -1125,7 +1153,10 @@ class App:
         inner, rows = width - 2, height - 2
         body = []
         if not st.running:
-            body.append([("  ",), (self.spinner() + " Music.app is starting…", "grey")])
+            body.append([("  Music.app is not running", "grey")])
+            body.append([])
+            body.append([("  Press ", "grey"), ("space", "bold"),
+                         (" to start it", "grey")])
         elif st.stopped:
             body += [[], [("  ■  nothing playing", "grey")], [],
                      [("  pick a playlist and press ", "grey"), ("enter", "bold")]]
@@ -2298,7 +2329,7 @@ def run_tui():
             app.start()
             while app.running:
                 app.render()
-                for key in keys.poll(FRAME):
+                for key in keys.poll(app.frame_delay()):
                     app.handle(key)
                     if not app.running:
                         break

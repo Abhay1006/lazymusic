@@ -1315,6 +1315,99 @@ class TestQueueDraining(unittest.TestCase):
         self.assertIn("queueitems", self.sent)
 
 
+class TestPollDoesNotLaunchMusic(unittest.TestCase):
+    """Quitting Music.app has to stick, even with lazymusic still open."""
+
+    def setUp(self):
+        self.app = tui.App()
+        self.addCleanup(self.app.close)
+        self.calls = []
+        # `submit` runs the job here rather than on the worker so the arguments
+        # the poll would have sent to Music can be read straight back.
+        def submit(key, call, then=None):
+            self.calls.append((key, call))
+            return True
+        self.app.bus.submit = submit
+        self.launched = []
+        self.real_status = music.status
+        music.status = lambda autolaunch=False: self.launched.append(autolaunch)
+        self.addCleanup(setattr, music, "status", self.real_status)
+
+    def poll(self, **kw):
+        self.app._last_state = 0.0
+        self.app.refresh(**kw)
+        for _key, call in self.calls:
+            call()
+        self.calls.clear()
+
+    def test_the_periodic_poll_never_starts_music(self):
+        self.poll()
+        self.assertEqual(self.launched, [False])
+
+    def test_polling_forever_still_never_starts_music(self):
+        for _ in range(20):
+            self.poll()
+        self.assertNotIn(True, self.launched)
+
+    def test_startup_and_keypresses_may_start_it(self):
+        self.poll(force=True)
+        self.assertEqual(self.launched, [True])
+
+
+class TestIdleCostsNothing(unittest.TestCase):
+    """A lazymusic nobody is watching should not keep the CPU warm."""
+
+    def setUp(self):
+        self.app = tui.App()
+        self.addCleanup(self.app.close)
+        self.app.bus.submit = lambda key, call, then=None: True
+        self.app.state.running = True
+
+    def gap(self):
+        """The wait `refresh` is currently enforcing between state reads."""
+        self.app._last_state = time.monotonic()
+        for gap in (tui.STATE_PLAYING, tui.STATE_IDLE, tui.STATE_DOWN):
+            self.app._last_state = time.monotonic() - gap
+            fired = []
+            self.app.bus.submit = lambda key, call, then=None: fired.append(key)
+            self.app.refresh()
+            if fired:
+                return gap
+        return None
+
+    def test_a_playing_track_is_watched_closely(self):
+        self.app.state.player = "playing"
+        self.assertEqual(self.gap(), tui.STATE_PLAYING)
+
+    def test_a_paused_one_is_watched_less(self):
+        self.app.state.player = "paused"
+        self.assertEqual(self.gap(), tui.STATE_IDLE)
+
+    def test_a_quit_music_is_barely_watched_at_all(self):
+        self.app.state.running = False
+        self.assertEqual(self.gap(), tui.STATE_DOWN)
+
+    def test_the_frame_rate_drops_when_the_screen_cannot_change(self):
+        self.app.state.player = "stopped"
+        self.assertEqual(self.app.frame_delay(), tui.IDLE_FRAME)
+
+    def test_a_playing_track_keeps_the_fast_frame(self):
+        self.app.state.player = "playing"
+        self.assertEqual(self.app.frame_delay(), tui.FRAME)
+
+    def test_a_frame_in_flight_keeps_the_fast_frame(self):
+        self.app.state.player = "stopped"
+        self.app.bus.inflight.add("status")
+        self.addCleanup(self.app.bus.inflight.discard, "status")
+        self.assertEqual(self.app.frame_delay(), tui.FRAME)
+
+    def test_a_message_on_screen_keeps_the_fast_frame(self):
+        # It has to disappear on time, which means repainting when it expires.
+        self.app.state.player = "stopped"
+        self.app.notify("queued something")
+        self.assertEqual(self.app.frame_delay(), tui.FRAME)
+
+
 # ---------------------------------------------------------------------------
 # Multi-language layout.
 #
