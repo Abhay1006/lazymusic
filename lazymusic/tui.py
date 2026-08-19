@@ -1,8 +1,13 @@
 """lazymusic - a lazygit-style panel UI for Apple Music.
 
-Three stacked panels on the left (player, playlists, search) and a main track
-list on the right. Tab or the number keys move focus; the focused panel gets a
-bright border, and the main panel follows whatever the focused list is showing.
+Two stacked panels on the left (player, playlists) and a main panel on the
+right. Tab or the number keys move focus; the focused panel gets a bright
+border, and the main panel follows whatever the focused list is showing.
+
+The main panel is the only one wide enough to read a track and its artist side
+by side, so everything big goes there rather than into a column of its own: the
+track list, search results, the cover, lyrics, the queue and the key sheet all
+take it over in turn. `VIEW_LANE` maps each of those to the lane it scrolls.
 
 Frames are composed as whole rows and written home-cursor-first with per-line
 erases rather than a screen clear, so the display never flickers.
@@ -14,12 +19,13 @@ import select
 import shutil
 import subprocess
 import sys
+import tempfile
 import termios
 import threading
 import time
 import tty
 
-from . import music
+from . import art, lyrics, music
 from .fmt import bar, box, mmss, pad, row, truncate, width_of
 from .osa import MusicError
 
@@ -33,13 +39,48 @@ STATE_IDLE = 3.0     # ...and while paused or stopped, where nothing moves
 LOAD_DELAY = 0.18  # settle time before loading the highlighted playlist
 CACHE_TTL = 60.0   # seconds a cached playlist stays fresh; `R` clears it early
 
-PLAYER, PLAYLISTS, SEARCH, TRACKS = 1, 2, 3, 4
+PLAYER, PLAYLISTS, TRACKS = 1, 2, 3
 NORMAL, FILTER, COMMAND = "normal", "filter", "command"
-PANELS = (PLAYER, PLAYLISTS, SEARCH, TRACKS)
-TITLES = {PLAYER: "Player", PLAYLISTS: "Playlists", SEARCH: "Search",
-          TRACKS: "Tracks"}
+PANELS = (PLAYER, PLAYLISTS, TRACKS)
+TITLES = {PLAYER: "Player", PLAYLISTS: "Playlists", TRACKS: "Tracks"}
 
 PLAYER_HEIGHT = 7  # 5 content rows plus two borders
+
+# What the main panel is currently showing. A cover, a lyric and a queue all
+# want the full width of the right-hand column, and the left stack is already
+# three boxes deep, so these take the main panel over rather than adding a
+# fifth box to a layout that is out of room. `help` has always worked this way.
+V_TRACKS, V_HELP, V_ART, V_LYRICS, V_QUEUE = (
+    "tracks", "help", "art", "lyrics", "queue")
+
+# The lane each view scrolls, keyed the same way `lanes` and `_views` are.
+# Cover art and the help sheet have nothing to scroll and so appear in neither.
+VIEW_LANE = {V_TRACKS: TRACKS, V_LYRICS: "lyrics", V_QUEUE: "queue",
+             V_HELP: "help"}
+VIEW_TITLE = {V_ART: "Now Playing", V_LYRICS: "Lyrics", V_QUEUE: "Up Next"}
+
+# Cover size. Each half block is one character cell, so how big a cover looks on
+# screen is set by the font, not by us - at a large font size a big cover is a
+# handful of enormous squares that read as a broken photo. Kept small it reads
+# as deliberate pixel art instead, which is the whole trick. LAZYMUSIC_ART_ROWS
+# overrides the cap for anyone on a small font with cells to spare.
+ART_MIN = 4        # below this there is no picture left to see
+ART_MAX = 12       # above this it stops looking intentional
+ART_GUTTER = 2     # blank columns between the cover and the details beside it
+ART_TEXT_MIN = 18  # if the details cannot get this much width, drop the cover
+CACHE_KEEP = 24   # covers and lyrics held in memory before the oldest is dropped
+
+
+def art_rows_for(height, inner):
+    """How tall the cover should be in this panel, or 0 if it does not fit."""
+    cap = ART_MAX
+    override = os.environ.get("LAZYMUSIC_ART_ROWS", "").strip()
+    if override.isdigit():
+        cap = max(ART_MIN, int(override))
+    # Two rows of padding above and below, and the details need room to its side.
+    beside = (inner - 2 - ART_GUTTER - ART_TEXT_MIN) // 2
+    rows = min(cap, height - 4, beside)
+    return rows if rows >= ART_MIN else 0
 
 HELP_LEFT = [
     ("MOTION", ""),
@@ -56,15 +97,25 @@ HELP_LEFT = [
     ("PANELS", ""),
     ("h / l", "left stack / main panel"),
     ("ctrl-w hjkl", "focus by direction"),
-    ("ctrl-w 1-4", "focus by number"),
+    ("ctrl-w 1-3", "focus by number"),
     ("tab", "cycle panels"),
+    ("", ""),
+    ("VIEWS", ""),
+    ("a", "cover art"),
+    ("y", "lyrics"),
+    ("u", "up next"),
+    ("esc", "back to tracks"),
+    ("", ""),
+    ("QUEUE", ""),
+    ("A", "queue this track"),
+    ("D", "remove from queue"),
 ]
 
 HELP_RIGHT = [
     ("SEARCH", ""),
     ("/", "filter this panel"),
     ("esc", "clear filter"),
-    ("S", "search the library"),
+    ("S", "search → panel 3"),
     ("*", "search artist under cursor"),
     ("ctrl-o", "back to previous view"),
     ("R", "reload library from Music"),
@@ -92,6 +143,9 @@ HELP_COMMANDS = [
     (":repeat [off|one|all]", ""),
     (":pause :next :prev", ""),
     (":fav", "favourite current track"),
+    (":art :lyrics :upnext", ""),
+    (":art test", "which glyphs render"),
+    (":upnext clear", "empty the queue"),
     (":reload", "re-read the library"),
     (":42", "jump to row 42"),
     (":help", "this panel"),
@@ -298,8 +352,10 @@ class App:
         self.state = music.State()
         self.lanes = {
             PLAYLISTS: Lane(lambda p: p[0]),
-            SEARCH: Lane(lambda t: t.name + " " + t.artist),
             TRACKS: Lane(lambda t: t.name + " " + t.artist),
+            "lyrics": Lane(lambda line: line[1]),
+            "queue": Lane(lambda t: t.name + " " + t.artist),
+            "help": Lane(lambda segs: ""),
         }
         self.mode = NORMAL
         self.buffer = ""          # text typed after `/` or `:`
@@ -307,7 +363,7 @@ class App:
         self.pending = ""         # `g`, `z` or `ctrl-w` awaiting a second key
         self._history = []        # previous main-panel views, for ctrl-o
         self._last_left = PLAYLISTS
-        self.help = False
+        self.view = V_TRACKS
         self.main_title = "Tracks"
         self.main_playlist = ""   # playlist the main panel is showing, if any
         self.message = ""
@@ -320,7 +376,21 @@ class App:
         self._cache = {}          # playlist name -> (fetched_at, tracks)
         self._last_frame = ""
         self._completions = []    # tab-completion candidates on the `:` line
+        self._art = {}            # (persistent ID, rows) -> rendered cover rows
+        self._lyrics = {}         # persistent ID -> Lyrics
+        self._lyric_pid = ""      # track the lyrics lane is currently holding
+        self._follow = True       # lyrics scroll with playback until you scroll
+        self._queue_kind = "none"  # "queue", "playlist" or "none" in Up Next
+        self._help_width = -1     # width the key sheet was last composed for
+        self._glyph_sample = False  # `:art test` shows the glyph families
+        # sips needs somewhere to put the decoded cover, and the raw artwork has
+        # to land on disk before it can be decoded at all. One directory for the
+        # session, emptied on the way out.
+        self._scratch = tempfile.mkdtemp(prefix="lazymusic-")
         self.bus = Bus()
+
+    def close(self):
+        shutil.rmtree(self._scratch, ignore_errors=True)
 
     # ------------------------------------------------------------ state ----
 
@@ -368,8 +438,23 @@ class App:
         if err:
             self.notify(str(err))
             return
+        before = self.state.track.pid
         self.state = state
         self._pos_at = time.monotonic()
+        if state.track.pid != before:
+            self.on_track_change()
+
+    def on_track_change(self):
+        """Whatever the main panel is showing now belongs to a different song.
+
+        The cover is not fetched here: the draw path asks for it by height, and
+        it cannot know the height until it knows how big the panel came out.
+        """
+        self._follow = True
+        if self.view == V_LYRICS:
+            self.want_lyrics()
+        elif self.view == V_QUEUE:
+            self.want_queue()
 
     @property
     def position(self):
@@ -440,6 +525,10 @@ class App:
         self.bus.submit("tracks", lambda: music.playlist_tracks(name), done)
 
     def show_main(self, title, tracks, playlist=""):
+        # Anything that fills the main panel with a list is asking for that list
+        # to be looked at, so a cover or a lyric sitting over it steps aside.
+        if self.view in (V_ART, V_LYRICS, V_QUEUE):
+            self.view = V_TRACKS
         lane = self.lanes[TRACKS]
         if title != self.main_title:
             lane.cursor = lane.scroll = 0
@@ -447,6 +536,152 @@ class App:
         lane.set_items(tracks)
         self.main_title = title
         self.main_playlist = playlist
+
+    # ------------------------------------------------- now-playing views ----
+
+    def set_view(self, view):
+        """Switch the main panel to `view`, or back to the track list if it is
+        already there - so every view key is its own toggle, as `?` always was."""
+        self.view = V_TRACKS if self.view == view else view
+        if view == V_ART:
+            self._glyph_sample = False
+        if self.view == V_LYRICS:
+            self._follow = True
+            self.want_lyrics()
+        elif self.view == V_QUEUE:
+            self.want_queue()
+        # Focus follows, so j/k scroll what you just asked to look at. The cover
+        # does not scroll, so moving focus there would only strand the cursor.
+        if self.view in (V_LYRICS, V_QUEUE):
+            self.focus = TRACKS
+
+    @staticmethod
+    def _trim(cache):
+        """Keep a fetch cache from growing for the whole life of the session."""
+        while len(cache) > CACHE_KEEP:
+            cache.pop(next(iter(cache)))
+
+    def want_art(self, rows):
+        """Fetch and render the current cover at `rows` high, once.
+
+        Called from the draw path, which is the only place the panel height is
+        known. `submit` drops a duplicate key, so asking every frame queues one
+        job; an empty result is cached too, so a track with no cover is not
+        re-fetched on every repaint.
+        """
+        pid = self.state.track.pid
+        # The glyph decides how many pixels a row holds, so it belongs in the
+        # key: switching it must not hand back the old rendering.
+        key = (pid, rows, art.glyph_mode())
+        if not pid or key in self._art:
+            return
+        source = os.path.join(self._scratch, "cover")
+        decoded = os.path.join(self._scratch, "cover.bmp")
+
+        def job():
+            if not music.save_artwork(source):
+                return []
+            return art.render(source, rows, decoded)
+
+        def done(value, err):
+            if err:
+                self.notify(str(err))
+                return
+            # `save_artwork` reads whatever is playing when it runs, so a track
+            # change mid-flight would file the new cover under the old song.
+            if self.state.track.pid != pid:
+                return
+            self._art[key] = value
+            self._trim(self._art)
+
+        self.bus.submit("art", job, done)
+
+    def want_lyrics(self):
+        track = self.state.track
+        if not track.pid or track.pid in self._lyrics:
+            return
+
+        def done(value, err):
+            if err:
+                # A lyric that cannot be found is not worth an error row; note
+                # it on the key bar and cache the miss so it is asked for once.
+                self._lyrics[track.pid] = lyrics.Lyrics()
+                self.notify("lyrics: %s" % err)
+            else:
+                self._lyrics[track.pid] = value
+            self._trim(self._lyrics)
+
+        self.bus.submit("lyrics", lambda: lyrics.for_track(track), done)
+
+    def want_queue(self):
+        """Refill Up Next.
+
+        The lazymusic queue wins when it has anything in it; otherwise the panel
+        falls back to showing what is left of the playlist now playing, which is
+        the best guess available given Music.app publishes no queue of its own.
+        """
+        playlist = self.state.playlist
+
+        def job():
+            queued = music.queue_tracks()
+            if queued:
+                return ("queue", queued)
+            if not playlist:
+                return ("none", [])
+            return ("playlist", music.playlist_tracks(playlist))
+
+        def done(value, err):
+            if err:
+                self.notify(str(err))
+                return
+            kind, tracks = value
+            self._queue_kind = kind
+            if kind == "playlist":
+                self._cache[playlist] = (time.monotonic(), tracks)
+                tracks = self.after_current(tracks)
+            lane = self.lanes["queue"]
+            lane.set_items(tracks)
+            lane.clamp(self._views.get("queue", 10))
+
+        self.bus.submit("queue", job, done)
+
+    def enqueue(self, track):
+        """Add `track` to the queue playlist, creating it on first use."""
+        def done(_value, err):
+            if err:
+                self.notify(str(err))
+                return
+            self.notify("queued %s" % track.label)
+            self.want_queue()
+        self.bus.submit("enqueue", lambda: music.queue_add(track.pid), done)
+
+    def dequeue(self):
+        """Drop the highlighted track from the queue, by position."""
+        if self._queue_kind != "queue":
+            self.notify("nothing queued - press A on a track to queue it")
+            return
+        lane = self.lanes["queue"]
+        if not lane.items:
+            return
+        track = lane.selected
+        # The lane may be filtered, so its cursor is not the playlist position.
+        index = lane.all_items.index(track) + 1
+
+        def done(_value, err):
+            if err:
+                self.notify(str(err))
+                return
+            self.notify("removed %s" % track.label)
+            self.want_queue()
+        self.bus.submit("dequeue", lambda: music.queue_remove(index), done)
+
+    def after_current(self, tracks):
+        """The tracks following the playing one, or all of them if it is absent."""
+        pid = self.state.track.pid
+        for i, track in enumerate(tracks):
+            if track.pid == pid:
+                return tracks[i + 1:]
+        return list(tracks)
 
     # ------------------------------------------------------------- draw ----
 
@@ -457,15 +692,11 @@ class App:
         left_w = max(30, min(46, cols * 38 // 100))
         right_w = cols - left_w
 
-        player_h = min(PLAYER_HEIGHT, max(3, height - 8))
-        rest = height - player_h
-        lists_h = max(3, rest // 2)
-        search_h = max(3, rest - lists_h)
+        player_h = min(PLAYER_HEIGHT, max(3, height - 5))
 
         left = []
         left += self.panel_player(left_w, player_h)
-        left += self.panel_list(PLAYLISTS, left_w, lists_h)
-        left += self.panel_list(SEARCH, left_w, search_h)
+        left += self.panel_list(PLAYLISTS, left_w, height - player_h)
         left = left[:height] + [" " * left_w] * max(0, height - len(left))
         right = self.panel_main(right_w, height)
 
@@ -535,7 +766,7 @@ class App:
         inner = width - 2
         body = []
         if not lane.items:
-            hint = ("press / to search" if panel == SEARCH else "no playlists")
+            hint = "no playlists"
             body.append([("  " + hint, "grey")])
         else:
             # Column widths are settled once per panel, not per row - measuring
@@ -570,8 +801,22 @@ class App:
         return [(mark,), (left,), (" ",), (right, "grey")]
 
     def panel_main(self, width, height):
-        if self.help:
+        if self.view == V_HELP:
             return self.panel_help(width, height)
+        if self.view == V_ART:
+            return self.panel_art(width, height)
+        if self.view == V_LYRICS:
+            return self.panel_lyrics(width, height)
+        if self.view == V_QUEUE:
+            return self.panel_queue(width, height)
+        return self.panel_tracks(width, height)
+
+    def main_box(self, width, height, title, body, footer=""):
+        """Draw the main panel, numbered and bordered like the others."""
+        return box(width, height, "3 %s" % truncate(title, max(8, width - 24)),
+                   body, focused=self.focus == TRACKS, footer=footer)
+
+    def panel_tracks(self, width, height):
         lane = self.lanes[TRACKS]
         view = max(1, height - 2)
         self._views[TRACKS] = view
@@ -606,13 +851,232 @@ class App:
         footer = ""
         if len(lane.items) > view:
             footer = "%d/%d" % (lane.cursor + 1, len(lane.items))
-        title = "4 %s" % truncate(self.main_title, max(8, width - 24))
+        title = "3 %s" % truncate(self.main_title, max(8, width - 24))
         if lane.filter:
             caret = "▏" if self.mode == FILTER and focused else ""
             title += "  /%s%s" % (lane.filter, caret)
         return box(width, height, title, body, focused=focused, footer=footer)
 
-    def panel_help(self, width, height):
+    def art_details(self, width):
+        """The track details that sit beside the cover, wrapped to `width`."""
+        state, track = self.state, self.state.track
+        icon, tone = ("▶", "brightgreen") if state.playing else ("⏸", "yellow")
+        elapsed, total = mmss(self.position), mmss(track.duration)
+        bar_w = max(6, width - width_of(elapsed) - width_of(total) - 6)
+        frac = (self.position / track.duration) if track.duration else 0.0
+        flags = []
+        for name, on in (("shuffle", state.shuffle),
+                         ("repeat %s" % state.repeat, state.repeat != "off"),
+                         ("♥", track.loved)):
+            flags.append((name + "  ", "brightcyan" if on else "grey"))
+        # Singles are routinely tagged with the album named after the track, and
+        # printing the same words twice just eats a row.
+        album = "" if track.album.strip() == track.name.strip() else track.album
+        return [
+            [(truncate(track.name, width), "bold")],
+            [(truncate(track.artist, width), "white")],
+            [(truncate(album, width), "grey")],
+            [],
+            [(icon + " ", tone), (elapsed, "grey"), (" ",),
+             (bar(frac, bar_w), "brightgreen"), (" ",), (total, "grey")],
+            flags,
+            [],
+            [("vol %s %d%%" % (bar(state.volume / 100.0, 10, "▪", "·", "▪"),
+                               state.volume), "grey")],
+        ]
+
+    def panel_glyphs(self, width, height):
+        """Every glyph family on screen at once.
+
+        A terminal cannot be asked whether it owns a codepoint - a missing glyph
+        still takes up its cell, so nothing distinguishes it from a real one
+        until it is drawn. Showing them is the only honest test.
+        """
+        inner = width - 2
+        current = art.glyph_mode()
+        body = [[], [("  a row of boxes or question marks means your terminal "
+                      "lacks that family", "grey")], []]
+        for mode, label, shown in art.sample_rows(inner - 6):
+            here = mode == current
+            body.append([("  %s " % ("▸" if here else " "),
+                          "brightcyan" if here else "grey"),
+                         (label, "bold" if here else "white"), ("  ",), (shown,)])
+            body.append([])
+        body.append([("  choose with ", "grey"), (":art half", "brightcyan"),
+                     (" · ", "grey"), (":art quad", "brightcyan"),
+                     (" · ", "grey"), (":art sext", "brightcyan"),
+                     (" · ", "grey"), (":art oct", "brightcyan")])
+        body.append([("  then ", "grey"), ("a", "bold"),
+                     (" shows the cover; LAZYMUSIC_ART_GLYPH makes it stick",
+                      "grey")])
+        return self.main_box(width, height, "Glyph test", body)
+
+    def panel_art(self, width, height):
+        if self._glyph_sample:
+            return self.panel_glyphs(width, height)
+        """A small cover on the left, the track details laid out beside it.
+
+        Side by side rather than stacked because the main panel is far wider
+        than it is tall, and a cover big enough to fill that width vertically
+        would be exactly the oversized-block problem the small size avoids.
+        """
+        inner = width - 2
+        track = self.state.track
+        title = VIEW_TITLE[V_ART]
+        if not track:
+            return self.main_box(width, height, title,
+                                 [[("  nothing playing", "grey")]])
+
+        rows = art_rows_for(height, inner)
+        if not rows:
+            # Too cramped for a cover; the details alone are still worth showing.
+            body = [[]] + [[("  ",)] + line
+                           for line in self.art_details(max(8, inner - 2))]
+            return self.main_box(width, height, title, body)
+
+        cover = self._art.get((track.pid, rows, art.glyph_mode()))
+        if cover is None:
+            self.want_art(rows)
+        cover_w = rows * 2
+        details = self.art_details(inner - 2 - cover_w - ART_GUTTER)
+
+        # While the cover is loading or missing, its square is held open so the
+        # details do not jump sideways the moment it lands.
+        note = "" if cover else ("no art" if cover == [] else "…")
+
+        # The card is as tall as whichever of the two columns is taller, and is
+        # centred in the panel rather than left hanging under the title.
+        card = max(rows, len(details))
+        body = [[] for _ in range(max(1, (height - 2 - card) // 2))]
+        for i in range(card):
+            line = [("  ",)]
+            if i >= rows:
+                line.append((" " * cover_w,))
+            elif cover:
+                line.append((cover[i],))
+            elif i == rows // 2:
+                line.append((pad(note.center(cover_w), cover_w), "grey"))
+            else:
+                line.append((" " * cover_w,))
+            line.append((" " * ART_GUTTER,))
+            if i < len(details):
+                line += details[i]
+            body.append(line)
+        return self.main_box(width, height, title, body)
+
+    def panel_lyrics(self, width, height):
+        lane = self.lanes["lyrics"]
+        view = max(1, height - 2)
+        self._views["lyrics"] = view
+        pid = self.state.track.pid
+        found = self._lyrics.get(pid) if pid else None
+
+        # The lane holds one track's lines at a time; refill it when the fetch
+        # for a different song lands.
+        if found is not None and self._lyric_pid != pid:
+            self._lyric_pid = pid
+            lane.set_items(found.lines)
+            lane.cursor = lane.scroll = 0
+
+        title = VIEW_TITLE[V_LYRICS]
+        if not pid:
+            return self.main_box(width, height, title,
+                                 [[("  nothing playing", "grey")]])
+        if found is None:
+            self.want_lyrics()
+            return self.main_box(width, height, title,
+                                 [[("  fetching lyrics…", "grey")]])
+        if not found.lines:
+            how = lyrics.mode()
+            note = {"off": "lyrics are switched off (LAZYMUSIC_LYRICS)",
+                    "tags": "no lyrics in this file's tags"}.get(
+                        how, "no lyrics found for this track")
+            return self.main_box(width, height, title, [[("  " + note, "grey")]])
+
+        # A timed transcript scrolls itself, up until the moment you scroll it
+        # by hand; `after_move` drops the follow and the next track restores it.
+        current = found.line_at(self.position) if found.synced else -1
+        if found.synced and self._follow and current >= 0 and current != lane.cursor:
+            lane.goto(current, view)
+            lane.reposition("zz", view)
+        lane.clamp(view)
+
+        inner = width - 2
+        body = []
+        for i in range(lane.scroll, min(len(lane.items), lane.scroll + view)):
+            text = lane.items[i][1]
+            if not text:
+                body.append([])
+            elif i == current:
+                body.append([(pad("  " + truncate(text, inner - 2), inner),
+                              "brightgreen", "bold")])
+            elif i == lane.cursor and self.focus == TRACKS and not found.synced:
+                body.append([(pad("  " + truncate(text, inner - 2), inner),
+                              "brightcyan", "bold")])
+            else:
+                body.append([("  ",), (truncate(text, inner - 2), "white")])
+
+        if found.synced:
+            title += "  ●" if self._follow else "  ○"
+        footer = found.source
+        if len(lane.items) > view:
+            footer = "%s  %d/%d" % (found.source, lane.cursor + 1, len(lane.items))
+        return self.main_box(width, height, title, body, footer=footer)
+
+    def panel_queue(self, width, height):
+        lane = self.lanes["queue"]
+        view = max(1, height - 2)
+        self._views["queue"] = view
+        lane.clamp(view)
+        inner = width - 2
+        body = []
+        if not lane.items:
+            note = ("nothing playing from a playlist" if not self.state.playlist
+                    else "nothing left in this playlist")
+            body.append([("  " + note, "grey")])
+            body.append([])
+            body.append([("  press ", "grey"), ("A", "bold"),
+                         (" on any track to queue it", "grey")])
+        else:
+            index_w = len(str(len(lane.items)))
+            right_w = min(max(12, inner // 3), max(0, inner - index_w - 12))
+            left_w = max(6, inner - right_w - index_w - 4)
+            for i in range(lane.scroll, min(len(lane.items), lane.scroll + view)):
+                track = lane.items[i]
+                selected = i == lane.cursor
+                num = str(i + 1).rjust(index_w)
+                mark = "▸" if selected else " "
+                name = pad(truncate(track.name, left_w), left_w)
+                artist = truncate(track.artist, right_w)
+                if selected:
+                    style = ("brightcyan", "bold") if self.focus == TRACKS else ("cyan",)
+                    body.append([(pad("%s %s %s %s" % (mark, num, name, artist),
+                                      inner),) + style])
+                else:
+                    body.append([("%s %s " % (mark, num), "grey"), (name,),
+                                 (" ",), (artist, "grey")])
+        if self._queue_kind == "queue":
+            title = "%s — queue (%d)" % (VIEW_TITLE[V_QUEUE], len(lane.all_items))
+        elif self._queue_kind == "playlist":
+            # Shuffle makes the real order unknowable, so the title stops
+            # claiming to know it rather than showing a confidently wrong list.
+            title = "%s — %s" % (VIEW_TITLE[V_QUEUE], self.state.playlist)
+            if self.state.shuffle:
+                title += "  ~shuffled"   # the real order is Music's to know
+        else:
+            title = VIEW_TITLE[V_QUEUE]
+        footer = ""
+        if len(lane.items) > view:
+            footer = "%d/%d" % (lane.cursor + 1, len(lane.items))
+        return self.main_box(width, height, title, body, footer=footer)
+
+    def help_rows(self, width):
+        """Compose the whole key sheet for this width, however tall it comes out.
+
+        The sheet outgrew a short terminal once the view and queue keys were
+        added, so it is built in full here and scrolled by `panel_help` rather
+        than being silently cut off at the bottom of the panel.
+        """
         inner = width - 2
         if inner >= 118:
             columns = [HELP_LEFT, HELP_RIGHT, HELP_COMMANDS]
@@ -637,16 +1101,36 @@ class App:
         key_ws = [min(max(len(k) for k, _ in col) + 2, col_w // 2 + 4)
                   for col in columns]
 
-        body = [[]]
+        rows = [[]]
         for i in range(max(len(c) for c in columns)):
             segs = []
             for col, key_w in zip(columns, key_ws):
                 segs += cell(col[i], key_w) if i < len(col) else [(" " * col_w,)]
-            body.append(segs)
-        body.append([])
-        body.append([("  press ", "grey"), ("?", "bold"), (" or ", "grey"),
+            rows.append(segs)
+        rows.append([])
+        rows.append([("  press ", "grey"), ("?", "bold"), (" or ", "grey"),
                      ("esc", "bold"), (" to close", "grey")])
-        return box(width, height, "Keys", body, focused=False)
+        return rows
+
+    def panel_help(self, width, height):
+        lane = self.lanes["help"]
+        view = max(1, height - 2)
+        self._views["help"] = view
+        if width != self._help_width:
+            self._help_width = width
+            lane.set_items(self.help_rows(width))
+            lane.cursor = lane.scroll = 0
+        # There is no cursor to show on a key sheet, so the cursor *is* the top
+        # of the view - otherwise the first dozen `j` presses would move an
+        # invisible marker and look like nothing had happened.
+        total = len(lane.items)
+        top = max(0, min(lane.cursor, max(0, total - view)))
+        lane.cursor = lane.scroll = top
+        body = lane.items[top:top + view]
+        footer = ""
+        if total > view:
+            footer = "j/k  %d-%d of %d" % (top + 1, min(top + view, total), total)
+        return box(width, height, "Keys", body, focused=False, footer=footer)
 
     def key_bar(self, cols):
         # The bottom line doubles as vim's command line: `/` and `:` prompts are
@@ -663,11 +1147,15 @@ class App:
         if self.message and time.monotonic() < self.message_until:
             return row([(" " + self.message, "yellow")], cols)
 
-        if self.help:
+        if self.view == V_HELP:
             pairs = [("?/esc", "close help")]
+        elif self.view != V_TRACKS:
+            pairs = [("space", "play/pause"), ("j/k", "move"), ("a", "art"),
+                     ("y", "lyrics"), ("u", "up next"), ("esc", "tracks"),
+                     ("?", "help"), ("q", "quit")]
         else:
             pairs = [("space", "play/pause"), ("j/k", "move"), ("h/l", "panel"),
-                     ("enter", "play"), ("/", "filter"), (":", "command"),
+                     ("enter", "play"), ("a", "art"), ("y", "lyrics"),
                      ("?", "help"), ("q", "quit")]
         segs = [(" ",)]
         for key, what in pairs:
@@ -699,9 +1187,14 @@ class App:
             return self.filter_key(key)
         if self.mode == COMMAND:
             return self.command_key(key)
-        if self.help:
+        if self.view == V_HELP:
             if key in ("?", "esc", "q", "enter"):
-                self.help = False
+                self.view = V_TRACKS
+                return
+            if key.isdigit():
+                self.count += key
+                return
+            self.motion_key(key, self.take_count())
             return
         self.normal_key(key)
 
@@ -743,7 +1236,7 @@ class App:
                 self.focus_stack(1)
             elif key in ("k", "up"):
                 self.focus_stack(-1)
-            elif key in ("1", "2", "3", "4"):
+            elif key in ("1", "2", "3"):
                 self.focus = int(key)
 
     def motion_key(self, key, count):
@@ -783,6 +1276,8 @@ class App:
     def after_move(self, moved):
         if moved and self.focus == PLAYLISTS:
             self.queue_playlist_load()
+        if moved and self.view == V_LYRICS:
+            self._follow = False
 
     def player_key(self, key, count):
         n = count or 1
@@ -814,7 +1309,13 @@ class App:
         if key == "q":
             self.running = False
         elif key == "?":
-            self.help = True
+            self.set_view(V_HELP)
+        elif key == "a":
+            self.set_view(V_ART)
+        elif key == "y":
+            self.set_view(V_LYRICS)
+        elif key == "u":
+            self.set_view(V_QUEUE)
         elif key == "enter":
             self.activate()
         elif key == "tab":
@@ -837,18 +1338,36 @@ class App:
             self.pop_view()
         elif key == "R":
             self.reload()
+        elif key == "A":
+            self.enqueue_selection()
+        elif key == "D":
+            self.dequeue()
         elif key == "esc":
             self.count, self.pending = "", ""
             lane, view = self.focused_lane()
             if lane is not None and lane.filter:
                 lane.apply_filter("")
                 lane.clamp(view)
+            elif self.view != V_TRACKS:
+                self.view = V_TRACKS
 
     # -- focus ---------------------------------------------------------------
 
     def focused_lane(self):
-        lane = self.lanes.get(self.focus)
-        return lane, self._views.get(self.focus, 10)
+        """The lane the cursor is in, and how many of its rows are on screen.
+
+        The main panel is not one list but whichever the current view shows, so
+        focus on panel 4 resolves through `VIEW_LANE`; the cover and the help
+        sheet have no lane at all, and motions simply find nothing to move.
+        """
+        if self.view == V_HELP:
+            return self.lanes["help"], self._views.get("help", 10)
+        key = self.focus
+        if key == TRACKS:
+            key = VIEW_LANE.get(self.view)
+            if key is None:
+                return None, 0
+        return self.lanes.get(key), self._views.get(key, 10)
 
     def focus_column(self, left):
         """`h` / `l` cross between the left stack and the main panel."""
@@ -861,7 +1380,7 @@ class App:
                 self.focus = TRACKS
 
     def focus_stack(self, delta):
-        stack = (PLAYER, PLAYLISTS, SEARCH)
+        stack = (PLAYER, PLAYLISTS)
         if self.focus not in stack:
             self.focus = PLAYLISTS
             return
@@ -964,12 +1483,11 @@ class App:
                 self.notify(str(err))
                 return
             self.message = ""
-            lane = self.lanes[SEARCH]
-            lane.set_items(hits)
-            lane.cursor = lane.scroll = 0
             self.push_view()
+            # Results land in the main panel, which is the only one wide enough
+            # to read a track and its artist side by side.
             self.show_main("Search: %s" % rest, hits)
-            self.focus = self._last_left = SEARCH
+            self.focus = TRACKS
             if not hits:
                 self.notify("nothing in your library matches that")
 
@@ -1046,7 +1564,53 @@ class App:
         self.reload()
 
     def cmd_help(self, rest):
-        self.help = True
+        self.view = V_HELP
+
+    def cmd_art(self, rest):
+        """`:art` shows the cover; `:art half` / `:art oct` picks the glyph.
+
+        Octants pack four times the pixels into a cell but are Unicode 16, so a
+        terminal that has not caught up draws them as empty boxes. Switching is
+        a command rather than a setting so you can see the difference at once.
+        """
+        arg = rest.strip().lower()
+        if arg == "test":
+            self._glyph_sample = True
+            self.view = V_ART
+            return
+        if arg:
+            if not art.set_glyph(arg):
+                self.notify("art glyph must be one of: %s  (try :art test)"
+                            % ", ".join(art.GLYPH_ORDER))
+                return
+            self._glyph_sample = False
+            self.notify("cover glyph: %s" % art.glyph_mode())
+            self.view = V_ART
+            return
+        self.set_view(V_ART)
+
+    def cmd_lyrics(self, rest):
+        self.set_view(V_LYRICS)
+
+    def cmd_upnext(self, rest):
+        """`:upnext` shows the queue; `:upnext clear` empties it."""
+        if rest.strip() == "clear":
+            def done(_value, err):
+                self.notify(str(err) if err else "queue cleared")
+                self.want_queue()
+            self.bus.submit("qclear", music.queue_clear, done)
+            self.view = V_QUEUE
+            return
+        if rest:
+            self.notify("usage: :upnext [clear]")
+            return
+        self.set_view(V_QUEUE)
+
+    def cmd_enqueue(self, rest):
+        self.enqueue_selection()
+
+    def cmd_tracks(self, rest):
+        self.view = V_TRACKS
 
     COMMANDS = {
         "q": cmd_quit, "quit": cmd_quit, "qa": cmd_quit, "x": cmd_quit,
@@ -1058,6 +1622,9 @@ class App:
         "next": cmd_next, "prev": cmd_prev,
         "filter": cmd_filter, "f": cmd_filter, "reload": cmd_reload,
         "help": cmd_help, "h": cmd_help,
+        "art": cmd_art, "cover": cmd_art, "lyrics": cmd_lyrics,
+        "upnext": cmd_upnext, "queue": cmd_upnext, "tracks": cmd_tracks,
+        "enqueue": cmd_enqueue, "add": cmd_enqueue,
     }
 
     # -- actions -------------------------------------------------------------
@@ -1071,6 +1638,15 @@ class App:
             self.notify("no artist under the cursor")
             return
         self.cmd_search(artist)
+
+    def enqueue_selection(self):
+        """`A`: queue the track under the cursor, wherever that cursor is."""
+        lane, _ = self.focused_lane()
+        track = lane.selected if lane is not None else None
+        if not isinstance(track, music.Track):
+            self.notify("no track under the cursor")
+            return
+        self.enqueue(track)
 
     def push_view(self):
         self._history.append((self.main_title, self.lanes[TRACKS].all_items,
@@ -1092,16 +1668,26 @@ class App:
             if sel:
                 self.act(music.play_playlist, sel[0])
                 self.notify("playing %s" % sel[0])
-        elif self.focus in (SEARCH, TRACKS):
-            track = self.lanes[self.focus].selected
-            if not track:
-                return
-            if self.focus == TRACKS and self.main_playlist:
-                self.act(music.play_track_in_playlist, track.pid,
-                         self.main_playlist)
-            else:
-                self.act(music.play_track, track.pid)
-            self.notify("playing %s" % track.label)
+            return
+        lane, _ = self.focused_lane()
+        track = lane.selected if lane is not None else None
+        # The lyrics lane holds text, not tracks, and the cover has no lane;
+        # neither has anything for enter to play.
+        if not isinstance(track, music.Track):
+            return
+        # A track picked out of Up Next belongs to the playing playlist, so it
+        # is started in that context and the rest of the list follows on.
+        if self.focus == TRACKS and self.view == V_QUEUE:
+            playlist = music.QUEUE if self._queue_kind == "queue" else self.state.playlist
+        elif self.focus == TRACKS and self.view == V_TRACKS:
+            playlist = self.main_playlist
+        else:
+            playlist = ""
+        if playlist:
+            self.act(music.play_track_in_playlist, track.pid, playlist)
+        else:
+            self.act(music.play_track, track.pid)
+        self.notify("playing %s" % track.label)
 
 
 class WindowName:
@@ -1175,6 +1761,7 @@ def run_tui():
     except KeyboardInterrupt:
         pass
     finally:
+        app.close()
         sys.stdout.write(CUR_SHOW + ALT_OFF)
         sys.stdout.flush()
     return 0

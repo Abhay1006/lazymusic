@@ -214,19 +214,56 @@ def nudge_volume(delta):
     )
 
 
+# Music.app answers a property write with success even when it quietly drops it
+# - it does this whenever its playback engine has wedged, the same state in
+# which `play` and `next track` also silently do nothing. Setting shuffle and
+# then reading it back is the only way to tell, and saying so beats a key that
+# appears to do nothing at all.
+STUCK = "%s did not take - Music.app is ignoring commands and likely needs restarting"
+
+
+def _shuffle_enabled():
+    return tell("return (shuffle enabled) as text").strip() == "true"
+
+
 def set_shuffle(on):
-    tell("set shuffle enabled to %s" % ("true" if on else "false"))
+    """Turn shuffle on or off, confirming it actually took.
+
+    The write is retried once because the refusal is intermittent - the same
+    toggle typically lands a moment later. Only a second failure is reported,
+    so a transient hiccup does not put an error on the key bar.
+    """
+    want = "true" if on else "false"
+    for attempt in (0, 1):
+        got = tell("set shuffle enabled to %s\n"
+                   "delay 0.1\n"
+                   "return (shuffle enabled) as text" % want).strip()
+        if got == want:
+            return
+        if not attempt:
+            time.sleep(0.3)
+    raise MusicError(STUCK % "shuffle")
 
 
 def toggle_shuffle():
-    tell("set shuffle enabled to not (shuffle enabled)")
+    # Read then set, rather than `set ... to not (shuffle enabled)`, so the
+    # retry and the read-back in `set_shuffle` cover this path too.
+    set_shuffle(not _shuffle_enabled())
 
 
 def set_repeat(mode):
     if mode not in REPEAT_MODES:
         raise MusicError("repeat mode must be one of: %s" % ", ".join(REPEAT_MODES))
     # `song repeat` takes a keyword, not a string, so the mode is spliced in raw.
-    tell("set song repeat to %s" % mode)
+    for attempt in (0, 1):
+        got = tell("set song repeat to %s\n"
+                   "delay 0.1\n"
+                   "return (song repeat) as text" % mode).strip()
+        if got == mode:
+            return
+        if not attempt:
+            time.sleep(0.3)
+    raise MusicError(STUCK % "repeat")
 
 
 def cycle_repeat(current):
@@ -275,6 +312,10 @@ GROUP = "\x1e"  # record separator, between property columns
 _COLUMNS = """
 set AppleScript's text item delimiters to (character id 31)
 %(setup)s
+-- An empty selection cannot be coerced to text; asking for the columns anyway
+-- fails with -1700, which an empty playlist or a search with no hits would
+-- otherwise turn into an error rather than an empty list.
+if (count of %(sel)s) is 0 then return ""
 set c1 to (persistent ID of %(sel)s) as text
 set c2 to (name of %(sel)s) as text
 set c3 to (artist of %(sel)s) as text
@@ -312,6 +353,58 @@ def play_track(pid):
         "set t to (first track of library playlist 1 whose persistent ID is %s)\n"
         "play t" % lit(pid)
     )
+
+
+# ------------------------------------------------ artwork and lyrics ----
+
+# `raw data` gives the artwork bytes exactly as they are stored (JPEG or PNG);
+# the `data` property would hand back a PICT-wrapped copy instead, which nothing
+# outside Carbon can read. The file is opened, truncated and closed inside the
+# one script so the handle cannot outlive a failure.
+_ARTWORK = """
+set p to %s
+set n to 0
+try
+    set n to (count of artworks of current track)
+end try
+if n is 0 then return ""
+set a to (raw data of artwork 1 of current track)
+set f to (open for access (POSIX file p) with write permission)
+try
+    set eof f to 0
+    write a to f
+    close access f
+on error e
+    try
+        close access f
+    end try
+    error e
+end try
+return (format of artwork 1 of current track) as text
+"""
+
+
+def save_artwork(path):
+    """Write the current track's cover art to `path`. Returns "" if it has none.
+
+    Roughly 160ms for a 600x600 cover, so this belongs on the Bus rather than
+    the draw loop. Callers cache the result against the track's persistent ID.
+    """
+    return tell(_ARTWORK % lit(path), timeout=20.0).strip()
+
+
+def current_lyrics():
+    """Lyrics embedded in the current track's tags, or "" when there are none.
+
+    This only ever sees lyrics stored in the file itself. Apple Music's own
+    streaming lyrics are not exposed to AppleScript at all, so for most library
+    tracks this is empty and the network lookup in `lyrics.py` is what answers.
+    """
+    return tell('try\n'
+                '    return (lyrics of current track)\n'
+                'on error\n'
+                '    return ""\n'
+                'end try')
 
 
 # --------------------------------------------------------------- playlists ----
@@ -358,11 +451,76 @@ def play_track_in_playlist(pid, playlist):
     )
 
 
+# ------------------------------------------------------------------- queue ----
+#
+# Music.app publishes no queue: there is no `up next` anywhere in its scripting
+# dictionary, so nothing can read or write the real one. lazymusic therefore
+# keeps its own, as an ordinary playlist. Holding it in a playlist rather than
+# in memory is what makes it work properly - Music plays a playlist natively and
+# in order, with its own shuffle and repeat, so nothing has to watch for the end
+# of a track and race to start the next one.
+#
+# The playlist is made on first use, so anyone who never queues anything is
+# never left with a stray playlist in their library.
+
+QUEUE = "lazymusic queue"
+
+
+def queue_exists():
+    return tell("return (exists user playlist %s) as text"
+                % lit(QUEUE)).strip() == "true"
+
+
+def queue_tracks():
+    if not queue_exists():
+        return []
+    return _columns("(every track of user playlist pl)",
+                    setup="set pl to %s" % lit(QUEUE))
+
+
+def queue_add(pid):
+    """Append a library track to the queue, making the playlist if needed.
+
+    Duplicating into a playlist keeps the track's persistent ID, so the playing
+    marker and removal both still match it afterwards.
+    """
+    tell("set nm to %s\n"
+         "if not (exists user playlist nm) then\n"
+         "    make new user playlist with properties {name:nm}\n"
+         "end if\n"
+         "set t to (first track of library playlist 1 whose persistent ID is %s)\n"
+         "duplicate t to user playlist nm" % (lit(QUEUE), lit(pid)))
+
+
+def queue_remove(index):
+    """Drop the track at 1-based `index`.
+
+    By position rather than by ID, so queueing the same song twice and removing
+    one copy does the obvious thing instead of always taking the first.
+    """
+    # Unparenthesised: `delete (track N of ...)` resolves to an object that has
+    # no delete handler and fails with -1708, but the plain command form works.
+    tell("delete track %d of user playlist %s" % (int(index), lit(QUEUE)))
+
+
+def queue_clear():
+    tell("set nm to %s\n"
+         "if (exists user playlist nm) then\n"
+         "    delete every track of user playlist nm\n"
+         "end if" % lit(QUEUE))
+
+
+def play_queue():
+    tell("play user playlist %s" % lit(QUEUE))
+
+
 __all__ = [
     "MusicError", "REPEAT_MODES", "State", "Track", "cycle_repeat",
     "ensure_running", "is_running", "launch", "next_track", "nudge_volume", "pause", "play", "play_playlist",
     "play_track", "play_track_in_playlist", "playlist_tracks", "playlists",
-    "prev_track", "search", "seek",
+    "prev_track", "search", "seek", "save_artwork", "current_lyrics",
+    "QUEUE", "queue_add", "queue_clear", "queue_exists", "queue_remove",
+    "queue_tracks", "play_queue",
     "set_loved", "set_repeat", "set_shuffle", "set_volume", "status", "stop",
     "toggle", "toggle_loved", "toggle_shuffle",
 ]

@@ -8,6 +8,7 @@ already settled.
 """
 
 import os
+import re
 import sys
 import unicodedata
 
@@ -22,12 +23,47 @@ _CODES = {
 # Rounded box drawing, as lazygit draws them.
 TL, TR, BL, BR, H, V = "╭", "╮", "╰", "╯", "─", "│"
 
+_SGR = re.compile(r"^[0-9;]+$")
+_ESCAPE = re.compile(r"\033\[[0-9;]*m")
+
+
+class Raw(str):
+    """A string that already carries its own escapes, with its width recorded.
+
+    Album art is one coloured segment per character cell, which is thousands of
+    tiny segments a frame. Measuring each of those through `width_of` costs more
+    than drawing them. Art rows are built once per track instead and handed over
+    whole; `cols` is what `row` uses in place of measuring.
+    """
+
+    def __new__(cls, text, cols):
+        self = super().__new__(cls, text)
+        self.cols = cols
+        return self
+
+
+def fg(r, g, b):
+    """A 24-bit foreground style token, usable anywhere a colour name is."""
+    return "38;2;%d;%d;%d" % (r, g, b)
+
+
+def bg(r, g, b):
+    return "48;2;%d;%d;%d" % (r, g, b)
+
 
 def c(text, *styles):
     if not _ENABLED or not styles:
         return text
-    seq = ";".join(_CODES[s] for s in styles if s in _CODES)
+    # Names come from the table; anything that is already SGR parameters (what
+    # `fg` and `bg` produce) is passed straight through.
+    seq = ";".join(_CODES.get(s, s) for s in styles
+                   if s in _CODES or _SGR.match(s))
     return "\033[%sm%s\033[0m" % (seq, text) if seq else text
+
+
+def strip_ansi(text):
+    """Text with its colour escapes removed, so it can be measured or compared."""
+    return _ESCAPE.sub("", text)
 
 
 def set_color(enabled):
@@ -54,14 +90,18 @@ def bar(fraction, width, filled="━", empty="─", head="●"):
     return filled * pos + head + empty * (width - pos - 1)
 
 
-def char_width(ch):
-    """Columns a character occupies: 0 for combining marks, 2 for wide, else 1.
+# Marks that occupy no column of their own. `Mc` is the subtle one: Unicode
+# classes it as a *spacing* mark, but a terminal composes it onto the base letter
+# and advances the cursor once for the pair - every Devanagari matra (ा ि ो),
+# and the same marks in Bengali, Tamil, Gujarati and Kannada, behave this way.
+# Counting them as a column each makes every such row pad short, which walks the
+# panel border left and tears the whole layout apart.
+_ZERO_WIDTH = ("Mn", "Me", "Mc", "Cf")
 
-    Combining marks matter here as much as CJK does - Devanagari track titles
-    carry a vowel sign or virama on most syllables, and counting those as a
-    column each makes every such row pad short and tear the panel edge.
-    """
-    if unicodedata.combining(ch) or unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+
+def char_width(ch):
+    """Columns a character occupies: 0 for combining marks, 2 for wide, else 1."""
+    if unicodedata.combining(ch) or unicodedata.category(ch) in _ZERO_WIDTH:
         return 0
     return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
 
@@ -100,7 +140,14 @@ def row(segments, width, styles=()):
     for seg in segments:
         if used >= width:
             break
-        text = truncate(seg[0], width - used)
+        text = seg[0]
+        if isinstance(text, Raw):
+            if used + text.cols > width:
+                continue          # pre-rendered and unsplittable; drop it whole
+            used += text.cols
+            out.append(text)
+            continue
+        text = truncate(text, width - used)
         if not text:
             continue
         used += width_of(text)
