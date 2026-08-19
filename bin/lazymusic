@@ -1,0 +1,12 @@
+#!/bin/sh
+# Launcher for `lazymusic`. Resolves its own location so the repo can live anywhere.
+self=$0
+while [ -L "$self" ]; do
+    link=$(readlink "$self")
+    case $link in
+        /*) self=$link ;;
+        *)  self=$(dirname "$self")/$link ;;
+    esac
+done
+root=$(cd "$(dirname "$self")/.." && pwd)
+PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m lazymusic "$@"
