@@ -15,6 +15,34 @@ from lazymusic import tui  # noqa: E402
 from lazymusic.tui import Keys, Lane  # noqa: E402
 
 
+_unpatched = []
+
+
+def setUpModule():
+    """Seal off Music.app for the whole file.
+
+    Several tests build a real `tui.App`, and a real App has a real worker
+    thread behind it: anything submitted to that worker runs for real, and
+    `tell application "Music"` *launches* Music when it is not already up. That
+    is how running the unit tests opened the app - silently, because the worker
+    swallows whatever a job raises and no assertion ever looked at the result.
+
+    Stubbing the bus in each test would work until the next test forgot to, so
+    the two routes out are closed here instead: `osa.run` sends every script,
+    and `music.launch` is the one deliberate start. A test that wants either
+    has to say so by patching it back.
+    """
+    def blocked(*_args, **_kwargs):
+        raise osa.MusicError("the unit tests must not talk to Music.app")
+    _unpatched.append((osa.run, music.launch))
+    osa.run = blocked
+    music.launch = blocked
+
+
+def tearDownModule():
+    osa.run, music.launch = _unpatched.pop()
+
+
 class TestTime(unittest.TestCase):
     def test_mmss(self):
         self.assertEqual(fmt.mmss(0), "0:00")
@@ -1877,3 +1905,27 @@ class TestAccent(unittest.TestCase):
         app.state.track = Track(pid="p", name="x")
         app._accent["p"] = (10, 20, 30)
         self.assertEqual(app.tone, fmt.fg(10, 20, 30))
+
+
+class TestNothingReachesMusic(unittest.TestCase):
+    """Running the tests must never open Music.app."""
+
+    def test_a_script_is_refused(self):
+        with self.assertRaises(osa.MusicError):
+            music.status(autolaunch=True)
+
+    def test_starting_it_is_refused(self):
+        with self.assertRaises(osa.MusicError):
+            music.launch()
+
+    def test_a_real_worker_thread_cannot_get_through(self):
+        # `start` submits the jobs a fresh App fires on its own - the ones that
+        # were reaching Music while the assertions passed regardless.
+        app = tui.App()
+        self.addCleanup(app.close)
+        app.start()
+        deadline = time.monotonic() + 5.0
+        while app.bus.busy and time.monotonic() < deadline:
+            time.sleep(0.01)
+            app.bus.drain()
+        self.assertFalse(app.bus.busy, "worker jobs never came back")
