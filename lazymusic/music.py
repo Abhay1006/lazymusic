@@ -503,6 +503,21 @@ def queue_remove(index):
     tell("delete track %d of user playlist %s" % (int(index), lit(QUEUE)))
 
 
+def queue_remove_pid(pid):
+    """Drop the first queue entry with this persistent ID, if it is still there.
+
+    Used to drain a track once it has finished playing, so the queue empties as
+    it goes instead of replaying from the top the next time it is started. A
+    miss is ignored: the entry may already have been removed by hand.
+    """
+    tell("set nm to %s\n"
+         "if (exists user playlist nm) then\n"
+         "    try\n"
+         "        delete (first track of user playlist nm whose persistent ID is %s)\n"
+         "    end try\n"
+         "end if" % (lit(QUEUE), lit(pid)))
+
+
 def queue_clear():
     tell("set nm to %s\n"
          "if (exists user playlist nm) then\n"
@@ -520,7 +535,7 @@ __all__ = [
     "play_track", "play_track_in_playlist", "playlist_tracks", "playlists",
     "prev_track", "search", "seek", "save_artwork", "current_lyrics",
     "QUEUE", "queue_add", "queue_clear", "queue_exists", "queue_remove",
-    "queue_tracks", "play_queue",
+    "queue_tracks", "queue_remove_pid", "play_queue",
     "set_loved", "set_repeat", "set_shuffle", "set_volume", "status", "stop",
     "toggle", "toggle_loved", "toggle_shuffle",
 ]

@@ -93,6 +93,9 @@ Motions take a count, so `12j` moves down twelve rows and `40G` jumps to row 40.
 | `y` | lyrics | `esc` | back to the track list |
 | `A` | queue the track under the cursor | `D` | remove it from the queue |
 
+Queued songs play automatically when the current track ends. With nothing
+playing at all, queueing one starts it straight away.
+
 Each of these takes over the main panel and toggles off with the same key, the
 way `?` always has. The left stack keeps playing, searching and browsing while
 they are open.
@@ -117,7 +120,7 @@ playlist from the start, or focus the main panel and pick a single track.
 | `:art` · `:lyrics` · `:upnext` | the main-panel views (`:tracks` goes back) |
 | `:art test` | show every glyph family; see which your terminal draws |
 | `:art half` · `quad` · `sext` · `oct` | cover glyph: 2, 4, 6 or 8 pixels per cell |
-| `:upnext clear` | empty the queue (`:add` queues the selection) |
+| `:upnext play` · `:upnext clear` | start the queue now; empty it (`:add` queues the selection) |
 | `:reload` | re-read the library (same as `R`) |
 | `:help` | the key list |
 
@@ -278,10 +281,28 @@ marks.) The default is therefore `quad`, which every terminal can draw, and
 `up next` anywhere in its scripting dictionary, so nothing can read or write the
 real play queue. `A` therefore appends to an ordinary user playlist named
 `lazymusic queue`, made on first use so anyone who never queues anything is
-never left with a stray playlist. Holding the queue in a playlist rather than in
-a list in memory is what makes it work properly: Music plays a playlist natively
-and in order, with its own shuffle and repeat, so nothing has to watch for the
-end of a track and race to start the next one.
+never left with a stray playlist.
+
+**The queue has to start itself.** Music advances inside whatever playlist is
+playing and offers no way to insert anything after the current track, so a queue
+can only take over by starting itself. `tick_queue` watches the interpolated
+position — no extra round trip — and starts the queue about a second *before*
+the current track ends. Firing early rather than reacting late is what makes the
+switch seamless: the last second of the outgoing song is cut, which nobody
+hears, where reacting to the change would leave a gap and a second of the wrong
+track. Once the queue is playing, Music carries on through it natively and the
+handoff stands down. Each track is dropped from the playlist as it finishes, so
+the queue drains as it goes instead of replaying from the top next time.
+
+Two things about that are not obvious. It must be `play playlist`: `current
+playlist` is read-only, and playing a *track* object leaves the previous
+playlist in place, so Music would carry on into that instead of through the
+queue and nothing would drain. And `play playlist` obeys shuffle, which would
+scramble a list whose entire point is its order — so shuffle is switched off for
+the queue and put back once playback has moved on to something else. That last
+step waits for playback to actually be running, because Music refuses property
+writes while it has no current playlist, which is exactly where it lands when
+the queue runs out. Toggling shuffle yourself cancels the obligation.
 
 `duplicate` into a playlist preserves a track's persistent ID, so the playing
 marker and removal still match it afterwards; removal is by **position** rather
@@ -346,6 +367,6 @@ falls back to LRCLIB). Both are explained under *How it works*.
 ## Development
 
 ```sh
-python3 -m unittest discover tests   # 161 tests, no Music.app needed
+python3 -m unittest discover tests   # 178 tests, no Music.app needed
 python3 -m lazymusic status          # run without installing
 ```

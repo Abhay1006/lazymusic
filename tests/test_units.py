@@ -724,7 +724,18 @@ class TestQueueEditing(unittest.TestCase):
         self.app.view = tui.V_TRACKS
         self.app.lanes[tui.TRACKS].set_items(self.tracks)
         self.app.normal_key("A")
-        self.assertEqual(self.sent, ["enqueue"])
+        self.assertEqual(self.sent, ["enqueue:p0"])
+
+    def test_queueing_several_tracks_quickly_keeps_them_all(self):
+        # `submit` drops a key already in flight, so a shared key would lose
+        # every song but the first when you queue a run of them.
+        self.app.focus = tui.TRACKS
+        self.app.view = tui.V_TRACKS
+        self.app.lanes[tui.TRACKS].set_items(self.tracks)
+        for _ in range(3):
+            self.app.normal_key("A")
+            self.app.normal_key("j")
+        self.assertEqual(self.sent, ["enqueue:p0", "enqueue:p1", "enqueue:p2"])
 
     def test_A_on_something_that_is_not_a_track_says_so(self):
         self.app.view = tui.V_LYRICS
@@ -737,7 +748,7 @@ class TestQueueEditing(unittest.TestCase):
     def test_D_removes_the_highlighted_queue_entry(self):
         self.queue_view(self.tracks)
         self.app.normal_key("D")
-        self.assertEqual(self.sent, ["dequeue"])
+        self.assertEqual(self.sent, ["dequeue:1"])
 
     def test_D_does_nothing_when_the_panel_is_showing_a_playlist(self):
         self.app.view = tui.V_QUEUE
@@ -1165,3 +1176,140 @@ class TestSearchPanelGone(unittest.TestCase):
         self.assertEqual(
             sorted(k for k in self.app.lanes if isinstance(k, str)),
             ["help", "lyrics", "queue"])
+
+
+class TestQueueHandoff(unittest.TestCase):
+    """Handing playback over to the queue as the current track runs out."""
+
+    def setUp(self):
+        self.app = tui.App()
+        self.addCleanup(self.app.close)
+        self.sent = []
+        self.app.bus.submit = lambda key, call, then=None: self.sent.append(key)
+        self.app._queue_items = [Track(pid="q1", name="Queued", artist="Band")]
+        self.playing("Other", remaining=0.5)
+
+    def playing(self, playlist, remaining, player="playing"):
+        st = self.app.state
+        st.player, st.playlist = player, playlist
+        st.track = Track(pid="cur", name="Current", duration=200.0)
+        st.position = 200.0 - remaining
+        self.app._pos_at = time.monotonic()
+
+    def test_it_fires_as_the_current_track_runs_out(self):
+        self.app.tick_queue()
+        self.assertEqual(self.sent, ["startqueue"])
+
+    def test_it_stays_out_of_the_way_earlier_in_the_track(self):
+        self.playing("Other", remaining=60.0)
+        self.app.tick_queue()
+        self.assertEqual(self.sent, [])
+
+    def test_nothing_queued_means_nothing_to_hand_over_to(self):
+        self.app._queue_items = []
+        self.app.tick_queue()
+        self.assertEqual(self.sent, [])
+
+    def test_it_stands_down_once_the_queue_is_what_is_playing(self):
+        # Music advances through a playlist by itself; taking over again would
+        # restart the queue from the top on every single track.
+        self.playing(music.QUEUE, remaining=0.5)
+        self.app.tick_queue()
+        self.assertEqual(self.sent, [])
+
+    def test_a_paused_player_is_left_alone(self):
+        self.playing("Other", remaining=0.5, player="paused")
+        self.app.tick_queue()
+        self.assertEqual(self.sent, [])
+
+    def test_a_track_with_no_duration_cannot_be_timed(self):
+        self.app.state.track.duration = 0.0
+        self.app.tick_queue()
+        self.assertEqual(self.sent, [])
+
+    def test_one_changeover_only_fires_once(self):
+        # The state read confirming the switch takes a moment to come back, and
+        # until it does the old playlist still looks like what is playing.
+        self.app.tick_queue()
+        self.sent.clear()
+        for _ in range(10):
+            self.app.tick_queue()
+        self.assertEqual(self.sent, [])
+
+
+class TestQueueShuffle(unittest.TestCase):
+    """Shuffle steps aside for the queue, and is put back afterwards."""
+
+    def setUp(self):
+        self.app = tui.App()
+        self.addCleanup(self.app.close)
+        self.sent = []
+        self.app.bus.submit = lambda key, call, then=None: self.sent.append(key)
+        self.app._queue_items = [Track(pid="q1", name="Queued")]
+
+    def test_starting_the_queue_with_shuffle_on_owes_it_back(self):
+        self.app.state.shuffle = True
+        self.app.start_queue()
+        self.assertTrue(self.app._shuffle_restore)
+
+    def test_with_shuffle_already_off_there_is_nothing_owed(self):
+        self.app.state.shuffle = False
+        self.app.start_queue()
+        self.assertFalse(self.app._shuffle_restore)
+
+    def test_it_is_not_put_back_while_the_queue_is_still_playing(self):
+        self.app._shuffle_restore = True
+        self.app.state.player, self.app.state.playlist = "playing", music.QUEUE
+        self.app.tick_queue()
+        self.assertNotIn("reshuffle", self.sent)
+
+    def test_it_is_not_put_back_while_playback_is_stopped(self):
+        # Music refuses property writes with no current playlist, which is
+        # exactly where it lands when the queue runs out.
+        self.app._shuffle_restore = True
+        self.app.state.player, self.app.state.playlist = "stopped", ""
+        self.app.tick_queue()
+        self.assertNotIn("reshuffle", self.sent)
+
+    def test_it_goes_back_once_something_else_is_playing(self):
+        self.app._shuffle_restore = True
+        self.app.state.player, self.app.state.playlist = "playing", "Road Trip"
+        self.app.tick_queue()
+        self.assertIn("reshuffle", self.sent)
+
+    def test_touching_shuffle_yourself_cancels_the_obligation(self):
+        self.app._shuffle_restore = True
+        self.app.act = lambda fn, *a: None
+        self.app.normal_key("s")
+        self.assertFalse(self.app._shuffle_restore)
+
+    def test_it_gives_up_rather_than_retrying_for_ever(self):
+        self.app._shuffle_restore = True
+        self.app.state.player, self.app.state.playlist = "playing", "Road Trip"
+        for _ in range(self.app.RESTORE_TRIES + 2):
+            self.app._restore_at = 0.0
+            self.app.tick_queue()
+        self.assertFalse(self.app._shuffle_restore)
+
+
+class TestQueueDraining(unittest.TestCase):
+    """A queued track that has played is dropped, so the queue empties."""
+
+    def setUp(self):
+        self.app = tui.App()
+        self.addCleanup(self.app.close)
+        self.sent = []
+        self.app.bus.submit = lambda key, call, then=None: self.sent.append(key)
+
+    def test_finishing_a_queued_track_drops_it(self):
+        self.app.on_track_change(before_pid="q1", before_playlist=music.QUEUE)
+        self.assertIn("drain", self.sent)
+
+    def test_finishing_a_track_from_elsewhere_drops_nothing(self):
+        self.app.on_track_change(before_pid="x1", before_playlist="Road Trip")
+        self.assertNotIn("drain", self.sent)
+
+    def test_the_queue_is_re_read_after_every_track_change(self):
+        # The handoff needs to know what is queued without the panel being open.
+        self.app.on_track_change(before_pid="x1", before_playlist="Road Trip")
+        self.assertIn("queueitems", self.sent)
