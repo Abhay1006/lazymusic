@@ -20,6 +20,7 @@ with no compression to undo, so reading it back is a header and a byte loop
 rather than a dependency on Pillow.
 """
 
+import colorsys
 import os
 import struct
 import subprocess
@@ -251,23 +252,75 @@ def sample_rows(width):
     return out
 
 
-def render(src, rows, scratch, glyph=None):
-    """Cover art at `src` as `rows` coloured rows. Returns [] if it cannot.
+def accent(pixels):
+    """The cover's most vivid colour, lifted to read well as text. None if grey.
 
-    `scratch` is the path the intermediate BMP is written to; the caller owns it
-    so the whole thing stays free of temporary-file bookkeeping.
+    Pixels are binned by hue and each bin is weighted towards saturated,
+    mid-lightness colour - the red of a logo rather than the brown of a shadow.
+    The winner is then brightened and saturated enough to be legible against a
+    terminal background, since it ends up painting progress bars and lyrics.
     """
-    if not color_enabled():
-        return []                     # a cover in monochrome is just noise
-    mode = glyph or glyph_mode()
-    _cols, (pixel_w, pixel_h) = cell_size(rows, mode)
-    if not to_bmp(src, scratch, pixel_w, pixel_h):
-        return []
-    try:
-        width, height, pixels = read_bmp(scratch)
-    except (OSError, ValueError):
-        return []
+    bins, seen = {}, 0
+    for line in pixels:
+        for r, g, b in line:
+            seen += 1
+            h, l, s = colorsys.rgb_to_hls(r / 255.0, g / 255.0, b / 255.0)
+            if s < 0.25 or l < 0.12 or l > 0.92:
+                continue
+            weight = s * (1.0 - abs(l - 0.5) * 1.4)
+            acc = bins.setdefault(int(h * 12) % 12, [0.0, 0.0, 0.0, 0.0])
+            acc[0] += weight
+            acc[1] += r * weight
+            acc[2] += g * weight
+            acc[3] += b * weight
+    if not bins:
+        return None
+    weight, rs, gs, bs = max(bins.values(), key=lambda acc: acc[0])
+    if weight < seen * 0.02:          # a speck of colour on a grey cover
+        return None
+    h, l, s = colorsys.rgb_to_hls(rs / weight / 255.0, gs / weight / 255.0,
+                                  bs / weight / 255.0)
+    l = min(max(l, 0.58), 0.72)
+    s = max(s, 0.55)
+    return tuple(int(round(v * 255)) for v in colorsys.hls_to_rgb(h, l, s))
+
+
+def draw(pixels, width, height, rows, mode):
+    """Fold a decoded pixel grid into `rows` text rows in glyph family `mode`."""
     wide, tall, glyphs, swap = glyph_table(mode)
     if glyphs is None:                # half blocks keep every pixel's colour
         return rows_from_pixels(pixels, width, height)[:rows]
     return rows_from_cells(pixels, width, height, wide, tall, glyphs, swap)[:rows]
+
+
+def load(src, scratch, pixel_w, pixel_h):
+    """Decode `src` resampled to `pixel_w` x `pixel_h`: (w, h, pixels) or None."""
+    if not to_bmp(src, scratch, pixel_w, pixel_h):
+        return None
+    try:
+        return read_bmp(scratch)
+    except (OSError, ValueError):
+        return None
+
+
+def cover(src, rows, scratch, glyph=None):
+    """Cover art at `src` as `rows` coloured rows, plus its accent colour.
+
+    Returns ([], None) if it cannot. `scratch` is the path the intermediate BMP
+    is written to; the caller owns it so the whole thing stays free of
+    temporary-file bookkeeping.
+    """
+    if not color_enabled():
+        return [], None               # a cover in monochrome is just noise
+    mode = glyph or glyph_mode()
+    _cols, (pixel_w, pixel_h) = cell_size(rows, mode)
+    decoded = load(src, scratch, pixel_w, pixel_h)
+    if decoded is None:
+        return [], None
+    width, height, pixels = decoded
+    return draw(pixels, width, height, rows, mode), accent(pixels)
+
+
+def render(src, rows, scratch, glyph=None):
+    """Cover art at `src` as `rows` coloured rows. Returns [] if it cannot."""
+    return cover(src, rows, scratch, glyph)[0]

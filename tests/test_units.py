@@ -1313,3 +1313,474 @@ class TestQueueDraining(unittest.TestCase):
         # The handoff needs to know what is queued without the panel being open.
         self.app.on_track_change(before_pid="x1", before_playlist="Road Trip")
         self.assertIn("queueitems", self.sent)
+
+
+# ---------------------------------------------------------------------------
+# Multi-language layout.
+#
+# Terminals do not agree on how wide text is: tmux on Linux gives a Devanagari
+# matra a column where tmux on macOS gives it none, and emoji and combining
+# marks vary the same way. The layout must survive every one of those, so these
+# tests replay the escape stream into a small grid that measures with a
+# *different* width table than lazymusic does, then look at where the borders
+# actually landed.
+
+import io  # noqa: E402
+import re  # noqa: E402
+import threading  # noqa: E402
+import unicodedata  # noqa: E402
+from unittest import mock  # noqa: E402
+
+
+def linux_width(ch):
+    """A terminal that counts spacing marks as a column, as glibc does."""
+    return 1 if unicodedata.category(ch) == "Mc" else fmt.char_width(ch)
+
+
+def narrow_width(ch):
+    """A terminal that draws every printable character one column wide."""
+    return 0 if fmt.char_width(ch) == 0 else 1
+
+
+class Grid:
+    """Just enough of a terminal to replay a frame: cursor moves, erases and
+    printable text, with autowrap off and a pluggable idea of width."""
+
+    _CSI = re.compile(r"\033\[([?0-9;]*)([A-Za-z])")
+    _OSC = re.compile(r"\033\][^\007]*\007")
+
+    def __init__(self, cols, rows, width=fmt.char_width):
+        self.cols, self.rows, self.width = cols, rows, width
+        self.cells = [[" "] * cols for _ in range(rows)]
+        self.y = self.x = 0
+
+    def feed(self, data):
+        data = self._OSC.sub("", data)
+        i = 0
+        while i < len(data):
+            m = self._CSI.match(data, i)
+            if m:
+                self._csi(m.group(1), m.group(2))
+                i = m.end()
+                continue
+            self._put(data[i])
+            i += 1
+        return self
+
+    def _csi(self, params, final):
+        nums = [int(p) for p in params.split(";") if p.isdigit()]
+        if final == "H":
+            self.y = (nums[0] if nums else 1) - 1
+            self.x = (nums[1] if len(nums) > 1 else 1) - 1
+        elif final == "G":
+            self.x = min(self.cols - 1, (nums[0] if nums else 1) - 1)
+        elif final == "X":
+            for c in range(self.x, min(self.cols, self.x + (nums[0] if nums else 1))):
+                self.cells[self.y][c] = " "
+        elif final == "K":
+            for c in range(self.x, self.cols):
+                self.cells[self.y][c] = " "
+        elif final == "J" and params == "2":
+            self.cells = [[" "] * self.cols for _ in range(self.rows)]
+
+    def _put(self, ch):
+        w = self.width(ch)
+        if w == 0:
+            if self.x > 0:               # composed onto the previous cell
+                self.cells[self.y][self.x - 1] += ch
+            return
+        x = min(self.x, self.cols - w)   # no autowrap: pile up at the edge
+        self.cells[self.y][x] = ch
+        if w == 2 and x + 1 < self.cols:
+            self.cells[self.y][x + 1] = ""
+        self.x = min(self.cols - 1, x + w) if x + w < self.cols else self.cols - 1
+        if x + w >= self.cols:
+            self.x = self.cols - 1
+
+    def column(self, x):
+        return [row[x] for row in self.cells]
+
+
+MIXED_LYRIC = """[ar:Arijit Singh]
+[offset:0]
+[00:01.00]हम तेरे बिन अब रह नहीं सकते
+[00:02.00]تم ہی ہو، اب تم ہی ہو
+[00:03.00]ਕਿਉਂਕਿ ਤੁਮ ਹੀ ਹੋ
+[00:04.00]夜に駆ける 沈むように溶けてゆくように
+[00:05.00]Tú eres el imán 🎶🔥	con tab
+[00:06.00]மனம் விட்டு பேசும் தமிழ் வரிகள் கொண்டது இது ஒரு நீண்ட வரி ஆகும் அதனால் இது மடிக்கப்பட வேண்டும் மீண்டும் மீண்டும்
+[00:07.00]Ẓ̵̢̛a̷l̴g̸o̵ ‮override‬
+"""
+
+
+def mixed_app():
+    app = tui.App()
+    app.bus.submit = lambda key, call, then=None: None
+    st = app.state
+    st.running, st.player, st.volume, st.position = True, "playing", 60, 3.5
+    st.playlist = "हिंदी गाने"
+    st.track = Track(pid="p1", name="तुम ही हो (From \"Aashiqui 2\")",
+                     artist="Arijit Singh, मिथुन", album="आशिक़ी 2", duration=262.0)
+    app._pos_at = time.monotonic()
+    app.lanes[tui.PLAYLISTS].set_items([("हिंदी गाने", 12), ("日本語", 8),
+                                        ("آفرین", 3), ("Focus", 118)])
+    app.show_main("हिंदी गाने", [
+        st.track, Track("p2", "夜に駆ける", "YOASOBI", "", 261.0),
+        Track("p3", "آفرین آفرین", "Rahat Fateh Ali Khan", "", 300.0),
+        Track("p4", "Despacito 🔥", "Luis Fonsi", "", 228.0),
+        Track("p5", "Ẓ̵̢̛a̷l̴g̸o̵\ttab", "x\x07bell", "", 1.0)], playlist="हिंदी गाने")
+    app._lyrics["p1"] = lyrics.Lyrics(lyrics.parse_lrc(MIXED_LYRIC), "lrclib",
+                                      synced=True)
+    return app
+
+
+class TestAnchoredLayout(unittest.TestCase):
+    """The borders stay put whatever width the terminal gives the text."""
+
+    COLS, ROWS = 120, 30
+
+    def setUp(self):
+        fmt.set_color(True)
+        self.app = mixed_app()
+        self.addCleanup(self.app.close)
+
+    def frame(self, view, width):
+        self.app.view = view
+        lines = self.app.compose(self.COLS, self.ROWS)
+        grid = Grid(self.COLS, self.ROWS, width)
+        for y, line in enumerate(lines):
+            grid.feed("\033[%d;1H" % (y + 1) + line)
+        return grid
+
+    def assert_borders(self, grid):
+        left_w = self.app._origin[tui.TRACKS]
+        edges = {0: "│╭╰", left_w - 1: "│╮╯", left_w: "│╭╰",
+                 self.COLS - 1: "│╮╯"}
+        for x, allowed in edges.items():
+            for y, ch in enumerate(grid.column(x)[:self.ROWS - 1]):
+                self.assertIn(ch[:1], allowed, "row %d col %d: %r\n%s" % (
+                    y, x, ch, "\n".join("".join(r) for r in grid.cells)))
+
+    def test_every_view_keeps_its_borders_in_every_terminal(self):
+        for width in (fmt.char_width, linux_width, narrow_width):
+            for view in (tui.V_TRACKS, tui.V_LYRICS, tui.V_ART, tui.V_QUEUE,
+                         tui.V_HELP):
+                with self.subTest(view=view, width=width.__name__):
+                    self.assert_borders(self.frame(view, width))
+
+    def test_no_control_character_reaches_the_terminal(self):
+        for view in (tui.V_TRACKS, tui.V_LYRICS):
+            self.app.view = view
+            text = "".join(self.app.compose(self.COLS, self.ROWS))
+            text = re.sub(r"\033(\[[?0-9;]*[A-Za-z]|\][^\007]*\007)", "", text)
+            for bad in ("\t", "\x07", "‮", "‬", "\n", "\r"):
+                self.assertNotIn(bad, text)
+
+    def test_a_long_lyric_wraps_instead_of_being_cut(self):
+        grid = self.frame(tui.V_LYRICS, linux_width)
+        left_w = self.app._origin[tui.TRACKS]
+        text = "\n".join("".join(r[left_w:]) for r in grid.cells[:-1])
+        self.assertIn("மீண்டும்", text.replace("\n", " "))
+        self.assertNotIn("…", text)
+
+    def test_metadata_tags_are_not_sung(self):
+        grid = self.frame(tui.V_LYRICS, fmt.char_width)
+        self.assertNotIn("[ar:", "\n".join("".join(r) for r in grid.cells))
+
+
+class TestFrameWrites(unittest.TestCase):
+    """Only rows that changed are sent, and never with a newline."""
+
+    def setUp(self):
+        self.app = tui.App()
+        self.addCleanup(self.app.close)
+        self.app.bus.submit = lambda key, call, then=None: None
+
+    def render(self, cols=100, rows=24):
+        out = io.StringIO()
+        with mock.patch.object(tui.shutil, "get_terminal_size",
+                               return_value=os.terminal_size((cols, rows))), \
+                mock.patch.object(tui.sys, "stdout", out):
+            self.app.render()
+        return out.getvalue()
+
+    def test_the_first_frame_clears_and_draws_every_row(self):
+        out = self.render()
+        self.assertIn(tui.CLR_ALL, out)
+        self.assertEqual(len(re.findall(r"\033\[\d+;1H", out)), 24)
+        self.assertNotIn("\n", out)
+
+    def test_an_unchanged_frame_writes_nothing(self):
+        self.render()
+        self.assertEqual(self.render(), "")
+
+    def test_a_change_rewrites_only_its_rows(self):
+        self.render()
+        self.app.notify("hello")
+        out = self.render()
+        self.assertEqual(re.findall(r"\033\[(\d+);1H", out), ["24"])
+
+    def test_a_resize_repaints_everything(self):
+        self.render()
+        out = self.render(cols=110)
+        self.assertIn(tui.CLR_ALL, out)
+
+    def test_the_window_is_named_after_the_song(self):
+        st = self.app.state
+        st.running, st.player = True, "playing"
+        st.track = Track(pid="p", name="Song", artist="Band", duration=100.0)
+        self.assertIn("\033]2;▶ Song - Band\007", self.render())
+
+
+class TestCleanAndWrap(unittest.TestCase):
+    def test_control_and_bidi_characters_are_removed(self):
+        self.assertEqual(fmt.clean("a\tb\x07c‮d‏e﻿"), "a bcde")
+
+    def test_plain_text_is_returned_untouched(self):
+        s = "Clair de Lune"
+        self.assertIs(fmt.clean(s), s)
+
+    def test_joiners_survive_since_scripts_need_them(self):
+        self.assertEqual(fmt.clean("क्‍ष"), "क्‍ष")
+
+    def test_wrapping_breaks_at_spaces(self):
+        self.assertEqual(fmt.wrap("one two three four", 9),
+                         ["one two", "three", "four"])
+
+    def test_text_without_spaces_is_broken_between_characters(self):
+        lines = fmt.wrap("夜に駆ける沈むように", 6)
+        self.assertTrue(all(fmt.width_of(l) <= 6 for l in lines))
+        self.assertEqual("".join(lines), "夜に駆ける沈むように")
+
+    def test_wrapped_lines_fit_even_where_marks_take_a_column(self):
+        text = "मनम् विट्टु पेसुम् तमिऴ् वरिकळ् कोण्डतु इतु ओरु नीण्ड वरि"
+        for line in fmt.wrap(text, 14):
+            self.assertLessEqual(fmt.widest(line), 14)
+
+    def test_a_mark_is_never_split_from_its_letter(self):
+        for line in fmt.wrap("किताबें", 2):
+            self.assertNotEqual(unicodedata.category(line[0])[0], "M")
+
+    def test_widest_counts_spacing_marks(self):
+        self.assertEqual(fmt.width_of("का"), 1)
+        self.assertEqual(fmt.widest("का"), 2)
+
+
+class TestTabStops(unittest.TestCase):
+    def test_a_tab_pads_to_its_column(self):
+        self.assertEqual(fmt.row([("ab",), (fmt.Tab(5),), ("c",)], 8), "ab   c  ")
+
+    def test_an_anchored_tab_moves_the_cursor_absolutely(self):
+        out = fmt.row([("ab",), (fmt.Tab(5),), ("c",)], 8, origin=10)
+        self.assertIn(fmt.cha(15), out)
+
+    def test_an_anchored_tab_brings_overflowing_text_back(self):
+        out = fmt.row([("abcdefgh",), (fmt.Tab(3),), ("X",)], 10, origin=1)
+        grid = Grid(20, 1).feed(out)
+        self.assertEqual("".join(grid.cells[0][:4]), "abcX")
+
+    def test_a_line_carries_its_band_across_the_padding(self):
+        fmt.set_color(True)
+        out = fmt.row(fmt.Line([("a",)], ("reverse",)), 4,
+                      fmt.Line([("a",)], ("reverse",)).styles)
+        self.assertTrue(out.endswith("\033[7m   \033[0m"))
+
+
+class TestKeysDecoding(unittest.TestCase):
+    class Stream:
+        def fileno(self):
+            return -1
+
+    def setUp(self):
+        self.keys = Keys(self.Stream())
+
+    def test_application_mode_arrows_are_arrows(self):
+        # Read as plain keys, `ESC O A` would queue the track under the cursor.
+        self.assertEqual(self.keys.decode("\033OA\033OB"), ["up", "down"])
+
+    def test_a_character_split_across_reads_is_rejoined(self):
+        raw = "ह".encode("utf-8")
+        first = self.keys.decode(self.keys._decoder.decode(raw[:1]))
+        second = self.keys.decode(self.keys._decoder.decode(raw[1:]))
+        self.assertEqual(first + second, ["ह"])
+
+
+class TestForgivingFilter(unittest.TestCase):
+    def setUp(self):
+        self.lane = Lane(lambda t: t)
+        self.lane.set_items(["Beyoncé - Halo", "Gymnopédie No. 1 Erik Satie",
+                             "तुम ही हो"])
+
+    def test_accents_are_ignored(self):
+        self.lane.apply_filter("beyonce")
+        self.assertEqual(self.lane.items, ["Beyoncé - Halo"])
+
+    def test_every_word_must_match_in_any_order(self):
+        self.lane.apply_filter("satie gymno")
+        self.assertEqual(self.lane.items, ["Gymnopédie No. 1 Erik Satie"])
+        self.lane.apply_filter("satie halo")
+        self.assertEqual(self.lane.items, [])
+
+    def test_other_scripts_still_match(self):
+        self.lane.apply_filter("तुम")
+        self.assertEqual(self.lane.items, ["तुम ही हो"])
+
+
+class TestLrcExtras(unittest.TestCase):
+    def test_id_tags_are_not_lyrics(self):
+        lines = lyrics.parse_lrc("[ar:Someone]\n[ti:Song]\n[00:01.00]hello")
+        self.assertEqual(lines, [(1.0, "hello")])
+
+    def test_the_offset_tag_shifts_every_stamp(self):
+        lines = lyrics.parse_lrc("[offset:+500]\n[00:02.00]a\n[00:03.00]b")
+        self.assertEqual([at for at, _ in lines], [1.5, 2.5])
+
+    def test_word_level_stamps_are_dropped(self):
+        lines = lyrics.parse_lrc("[00:01.00]<00:01.00>hello <00:01.50>world")
+        self.assertEqual(lines, [(1.0, "hello world")])
+
+    def test_line_at_is_a_binary_search_that_agrees(self):
+        found = lyrics.Lyrics([(float(i), str(i)) for i in range(100)], synced=True)
+        self.assertEqual(found.line_at(-1), -1)
+        self.assertEqual(found.line_at(41.5), 41)
+        self.assertEqual(found.line_at(1e9), 99)
+
+    def test_an_instrumental_is_known_as_one(self):
+        found = lyrics._from_payload({"instrumental": True})
+        self.assertFalse(found)
+        self.assertTrue(found.instrumental)
+
+
+class TestTitleCleanup(unittest.TestCase):
+    def test_catalogue_decorations_are_dropped(self):
+        for title, bare in (('Kun Faya Kun (From "Rockstar")', "Kun Faya Kun"),
+                            ("Hey Jude - Remastered 2015", "Hey Jude"),
+                            ("Despacito (feat. Justin Bieber)", "Despacito"),
+                            ("Kesariya - Lofi Version", "Kesariya"),
+                            ("Live and Let Die", "Live and Let Die")):
+            self.assertEqual(lyrics.simple_title(title), bare)
+
+    def test_the_lead_artist_is_the_first_credited(self):
+        self.assertEqual(lyrics.lead_artist("A.R. Rahman, Javed Ali & Mohit Chauhan"),
+                         "A.R. Rahman")
+        self.assertEqual(lyrics.lead_artist("Calvin Harris feat. Rihanna"),
+                         "Calvin Harris")
+        self.assertEqual(lyrics.lead_artist("AC/DC"), "AC/DC")
+
+    def test_a_miss_falls_back_to_the_bare_title(self):
+        asked = []
+
+        def fake_get(path, params):
+            asked.append((path, params))
+            if path == "get":
+                raise lyrics.urllib.error.HTTPError("u", 404, "nf", {}, None)
+            if params.get("track_name") == "Kun Faya Kun":
+                return [{"plainLyrics": "words", "duration": 473}]
+            return []
+
+        with mock.patch.object(lyrics, "_get", fake_get):
+            found = lyrics.from_lrclib("A.R. Rahman, Javed Ali", 'Kun Faya Kun (From "Rockstar")',
+                                       "Rockstar", 473)
+        self.assertEqual(found.lines, [(None, "words")])
+        self.assertEqual(asked[-1][1], {"artist_name": "A.R. Rahman",
+                                        "track_name": "Kun Faya Kun"})
+
+
+class TestBusLanes(unittest.TestCase):
+    def test_a_slow_lyrics_lookup_does_not_hold_up_playback(self):
+        bus = tui.Bus()
+        release = threading.Event()
+        bus.submit("lyrics", lambda: release.wait(5))
+        done = threading.Event()
+        bus.submit("act:toggle", done.set)
+        try:
+            self.assertTrue(done.wait(2), "play/pause waited behind the network")
+        finally:
+            release.set()
+
+    def test_jobs_are_routed_by_key(self):
+        bus = tui.Bus()
+        bus.submit("art:5", lambda: None)
+        bus.submit("status", lambda: None)
+        self.assertEqual(set(bus._lanes), {"art", "music"})
+
+
+class TestCommandsDoNotCrash(unittest.TestCase):
+    def setUp(self):
+        self.app = tui.App()
+        self.addCleanup(self.app.close)
+        self.acted = []
+        self.app.act = lambda fn, *a: self.acted.append((fn, a))
+
+    def test_a_bad_number_is_reported_not_raised(self):
+        for line in ("vol loud", "seek soon", "sleep later", "offset x"):
+            self.app.run_command(line)
+            self.assertEqual(self.app.message_kind, "error")
+
+
+class TestSleepTimer(unittest.TestCase):
+    def setUp(self):
+        self.app = tui.App()
+        self.addCleanup(self.app.close)
+        self.acted = []
+        self.app.act = lambda fn, *a: self.acted.append(fn)
+        self.app.state.player = "playing"
+        self.app.state.track = Track(pid="p", name="x")
+
+    def test_it_is_set_shown_and_cancelled(self):
+        self.app.run_command("sleep 30")
+        self.assertEqual(self.app.sleep_left(), "30m")
+        self.app.run_command("sleep off")
+        self.assertIsNone(self.app.sleep_left())
+
+    def test_it_pauses_when_it_runs_out(self):
+        self.app.run_command("sleep 30")
+        self.app.tick_sleep()
+        self.assertEqual(self.acted, [])
+        self.app._sleep_at = time.monotonic() - 1
+        self.app.tick_sleep()
+        self.assertEqual(self.acted, [music.pause])
+        self.assertIsNone(self.app.sleep_left())
+
+
+class TestSingFromHere(unittest.TestCase):
+    def setUp(self):
+        self.app = mixed_app()
+        self.addCleanup(self.app.close)
+        self.acted = []
+        self.app.act = lambda fn, *a: self.acted.append((fn, a))
+        self.app.set_view(tui.V_LYRICS)
+        self.app.panel_main(80, 20)
+
+    def test_enter_seeks_to_the_line_under_the_cursor(self):
+        self.app.lanes["lyrics"].goto(4, 10)
+        self.app._follow = False
+        self.app.normal_key("enter")
+        self.assertEqual(self.acted, [(music.seek, (5.0,))])
+        self.assertTrue(self.app._follow)
+
+    def test_the_offset_moves_the_highlight(self):
+        found = self.app._lyrics["p1"]
+        self.app.run_command("offset +1")
+        self.assertEqual(found.line_at(self.app.position - self.app._lyric_delay),
+                         found.line_at(self.app.position - 1.0))
+        self.app.run_command("offset")
+        self.assertEqual(self.app._lyric_delay, 0.0)
+
+
+class TestAccent(unittest.TestCase):
+    def test_the_vivid_colour_wins_over_the_dark_background(self):
+        pixels = [[(200, 30, 40)] * 10 + [(10, 10, 10)] * 30]
+        r, g, b = art.accent(pixels)
+        self.assertGreater(r, g + 80)
+
+    def test_a_grey_cover_has_no_accent(self):
+        self.assertIsNone(art.accent([[(128, 128, 128)] * 20]))
+
+    def test_the_interface_falls_back_without_one(self):
+        app = tui.App()
+        self.addCleanup(app.close)
+        self.assertEqual(app.tone, "brightgreen")
+        app.state.track = Track(pid="p", name="x")
+        app._accent["p"] = (10, 20, 30)
+        self.assertEqual(app.tone, fmt.fg(10, 20, 30))

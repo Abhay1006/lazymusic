@@ -7,34 +7,43 @@ control playback without ever bringing Music.app to the front.
 No dependencies — just Python 3 and the Music.app that ships with macOS.
 
 ```
-╭─ 1 Player ─────────────────────────╮╭─ 3 Evening ────────────────────────────────────────────────╮
-│  ▶  Clair de Lune                  ││   1 Gymnopédie No. 1                   Erik Satie          │
-│     Claude Debussy                 ││   2 Clair de Lune                      Claude Debussy      │
-│   1:36 ━━━━━━●───────────── 5:05   ││   3 Prelude in E Minor                 Frédéric Chopin     │
-│   shuffle  repeat one  ♥           ││   4 The Swan                           Camille Saint-Saëns │
-│   vol ▪▪▪▪▪▪▪▪·· 80%               ││▸  5 Air on the G String                J. S. Bach          │
-╰────────────────────────────────────╯│   6 Adagio for Strings                 Samuel Barber       │
-╭─ 2 Playlists ──────────────────────╮│   7 Nocturne Op. 9 No. 2               Frédéric Chopin     │
-│▸ Evening                         42││▶  8 Canon in D                         Johann Pachelbel    │
-│  Focus                          118││   9 Moonlight Sonata                   Ludwig van Beethoven│
-│  Road Trip                       64││  10 Ave Maria                          Franz Schubert      │
-│  Rainy Day                       27││  11 Für Elise                          Ludwig van Beethoven│
-│  Workout                         55││  12 Méditation                         Jules Massenet      │
-│  Jazz                            90││  13 Vocalise                           Sergei Rachmaninoff │
-│  Classical                      210││  14 Salut d'Amour                      Edward Elgar        │
-│  Covers                          33││  15 Liebestraum No. 3                  Franz Liszt         │
-│                                    ││  16 Berceuse                           Gabriel Fauré       │
-│                                    ││  17 Élégie                             Jules Massenet      │
-│                                    ││  18 Romance                            Robert Schumann     │
-│                                    ││  19 Barcarolle                         Jacques Offenbach   │
-│                                    ││  20 Chanson de Matin                   Edward Elgar        │
-│                                    ││                                                            │
-╰────────────────────────────────────╯╰────────────────────────────────────────────────────────────╯
- space play/pause   j/k move   h/l panel   enter play   a art   y lyrics   ? help   q quit          
+╭─ 1 Player ──────────────────────────╮╭─ 3 Evening ───────────────────────────────────────────────────╮
+│  ▶ Clair de Lune ▁▃▅                ││   1 Gymnopédie No. 1               Erik Satie             3:10│
+│    Claude Debussy                   ││▃  2 Clair de Lune                  Claude Debussy         5:05│
+│  1:36 ━━━━━━━●──────────────── 5:05 ││   3 Prelude in E Minor             Frédéric Chopin        2:11│
+│  ⇄ shuffle  ↻ repeat one  ♡         ││▸  4 The Swan                       Camille Saint-Saëns    3:03│
+│  vol ▪▪▪▪▪▪▪▪·· 80%                 ││   5 Air on the G String            J. S. Bach             5:22│
+╰─────────────────────────────────────╯│   6 Adagio for Strings             Samuel Barber          8:09│
+╭─ 2 Playlists ───────────────────────╮│   7 Nocturne Op. 9 No. 2           Frédéric Chopin        4:28│
+│▸ Evening                          42││   8 Canon in D                     Johann Pachelbel       5:45│
+│  Focus                           118││   9 Moonlight Sonata               Ludwig van Beethoven   6:01│
+│  Road Trip                        64││  10 Ave Maria                      Franz Schubert         4:57│
+│  Rainy Day                        27││  11 Für Elise                      Ludwig van Beethoven   2:55│
+│  Workout                          55││  12 Méditation                     Jules Massenet         5:02│
+│  Jazz                             90││  13 Vocalise                       Sergei Rachmaninoff    6:26│
+│  Classical                       210││  14 Salut d'Amour                  Edward Elgar           2:58│
+│  Covers                           33││  15 Liebestraum No. 3              Franz Liszt            4:50│
+│                                     ││  16 Berceuse                       Gabriel Fauré          3:35│
+│                                     ││  17 Élégie                         Jules Massenet         3:21│
+│                                     ││  18 Romance                        Robert Schumann        3:50│
+│                                     ││  19 Barcarolle                     Jacques Offenbach      3:32│
+│                                     ││  20 Chanson de Matin               Edward Elgar           3:16│
+│                                     ││                                                               │
+│                                     ││                                                               │
+│                                     ││                                                               │
+╰─────────────────────────────────────╯╰────────────────────────────────────────────────────── 1h 27m ─╯
+ space play/pause   j/k move   h/l panel   enter play   A queue   a art   y lyrics   ? help   q quit
 ```
 
-The focused panel takes a bright border. `▸` is your cursor, green `▶` is the
-track actually playing. Navigation is vim-style throughout — see below.
+The focused panel takes a bright border. `▸` is your cursor, and the little
+bouncing equaliser marks the track actually playing. Navigation is vim-style
+throughout — see below.
+
+Each song brings its own colours: the progress bar, the playing marker and the
+line being sung are tinted with the most vivid colour on the cover, and with
+room to spare the player shows a small copy of the cover beside the details.
+Titles and lyrics in any script — Hindi, Urdu, Punjabi, Tamil, Japanese,
+emoji — stay inside their panels, whatever your terminal thinks they measure.
 
 ## Install
 
@@ -83,6 +92,7 @@ Motions take a count, so `12j` moves down twelve rows and `40G` jumps to row 40.
 | `space` | play / pause | `*` | search the artist under the cursor |
 | `n` / `p` | next / previous track | `ctrl-o` | back to the previous view |
 | `R` | reload the library from Music |
+| `ctrl-l` | redraw the screen |
 | `[` / `]` | seek ∓10s | | |
 | `+` / `-` | volume | `enter` | play the selection |
 | `s` `r` `f` | shuffle, repeat, favourite | `?` | all keys |
@@ -92,6 +102,7 @@ Motions take a count, so `12j` moves down twelve rows and `40G` jumps to row 40.
 | `a` | cover art | `u` | up next |
 | `y` | lyrics | `esc` | back to the track list |
 | `A` | queue the track under the cursor | `D` | remove it from the queue |
+| `enter` in lyrics | jump the song to that line | `j` / `k` in lyrics | scroll (stops following) |
 
 Queued songs play automatically when the current track ends. With nothing
 playing at all, queueing one starts it straight away.
@@ -102,6 +113,9 @@ they are open.
 
 Highlighting a playlist loads it into the main panel; `enter` there plays the
 playlist from the start, or focus the main panel and pick a single track.
+
+`/` forgives: it ignores case and accents and matches every word in any order,
+so `beyonce` finds Beyoncé and `satie gymno` finds Gymnopédie No. 1.
 
 ### The `:` command line
 
@@ -121,6 +135,8 @@ playlist from the start, or focus the main panel and pick a single track.
 | `:art test` | show every glyph family; see which your terminal draws |
 | `:art half` · `quad` · `sext` · `oct` | cover glyph: 2, 4, 6 or 8 pixels per cell |
 | `:upnext play` · `:upnext clear` | start the queue now; empty it (`:add` queues the selection) |
+| `:sleep 30` · `:sleep off` | pause in 30 minutes; cancel (bare `:sleep` shows what is left) |
+| `:offset +0.5` · `:offset` | lyrics half a second later, for a transcript that runs early; reset |
 | `:reload` | re-read the library (same as `R`) |
 | `:help` | the key list |
 
@@ -164,15 +180,18 @@ Music.app exposes a scripting interface; lazymusic drives it through
 | `lazymusic/music.py` | the vocabulary: play, seek, search, playlists |
 | `lazymusic/cli.py` | argument handling and one-shot output |
 | `lazymusic/tui.py` | the panel UI |
-| `lazymusic/fmt.py` | colour, time codes, progress bars, boxes, text widths |
-| `lazymusic/art.py` | cover art as half-block cells |
+| `lazymusic/fmt.py` | colour, time codes, boxes, text widths, wrapping |
+| `lazymusic/art.py` | cover art as block-glyph cells, and its accent colour |
 | `lazymusic/lyrics.py` | lyrics from the file's tags, or from LRCLIB |
 
 **Nothing touches Music.app on the draw loop.** Every osascript round trip
 costs 70–150ms, and running those inline meant the UI froze for a large slice
-of each second — which read as lag. `tui.Bus` runs them on a worker thread and
+of each second — which read as lag. `tui.Bus` runs them on worker threads and
 hands results back through a queue that the UI thread drains, so callbacks stay
-single-threaded and no locks are needed.
+single-threaded and no locks are needed. Slow work gets a lane of its own: a
+lyrics lookup can sit on the network for seconds, and on a single worker every
+play/pause pressed meanwhile waited behind it. Lyrics, covers and everything
+else now run on three lanes, routed by the job's key.
 
 **Start Music.app rather than letting AppleScript do it.** Any `tell
 application "Music"` launches the app if it is not already up — loudly, with
@@ -181,10 +200,11 @@ its window landing on top of the terminal. `osa.launch` gets there first with
 every request through that check. The check itself uses `pgrep` (≈5ms) instead
 of asking System Events (≈80ms), because it sits on the polling path.
 
-**Never write a newline on the bottom row.** Doing so scrolls the whole grid up
-and silently eats the top border. The frame is joined with newlines *between*
-rows only. `tests/` cannot catch this — reconstructing the escape stream is not
-the same as knowing what the terminal grid holds — so verify with a real grid.
+**Never write a newline at all.** Writing one on the bottom row scrolls the whole
+grid up and silently eats the top border. Each row is placed with an absolute
+cursor move instead, autowrap is switched off while the UI is up, and only the
+rows that changed since the last frame are sent, inside a synchronized update
+(`?2026`) so a terminal that supports it never shows half a frame.
 
 A few more things worth knowing if you edit this:
 
@@ -207,6 +227,26 @@ can't measure it. Rows are therefore built as `(text, *styles)` segments and
 coloured last, by `fmt.row()`. Combining marks count as zero columns and CJK as
 two; getting that wrong tears the panel edge on non-Latin titles.
 
+**…and never trust the widths.** There is no right answer to how wide a Hindi
+lyric is, because terminals disagree: tmux on macOS gives a Devanagari matra no
+column and tmux on Linux gives it one, and emoji, Tamil and zalgo text vary the
+same way. A row padded by our count came out four columns too wide in the
+second kind, wrapped, scrolled the screen, and took the whole layout down with
+it. So `fmt.box` *anchors* every panel: each border is drawn with an absolute
+cursor move (`CSI n G`), and the interior is erased (`CSI n X`) before the text
+goes in. Text drawn wider than we measured runs under its own border and is
+overwritten; text drawn narrower leaves blank cells, not stale ones. Columns
+inside a row — title, artist, length — are `fmt.Tab` stops anchored the same
+way, so a mis-measured title can only shift itself. Lyrics are wrapped by the
+*widest* reading (`fmt.widest`, spacing marks counted), which fits either way.
+Text is also scrubbed on the way out (`fmt.clean`): a tab in a lyric jumps to
+the next tab stop, and a bidi override can make a bidi-aware terminal mirror the
+row, borders and all.
+
+`tests/` checks this against a real grid: `Grid` replays the escape stream into
+cells using a *different* width table from lazymusic's own, and the borders
+have to land in the right columns for every view.
+
 The subtle case is Unicode category **`Mc`**. Unicode classes it as a *spacing*
 mark, so the obvious reading is one column — but a terminal composes it onto the
 base letter and advances the cursor once for the pair. Every Devanagari matra
@@ -220,6 +260,16 @@ actually used.
 
 **Favourite, not loved.** macOS 15 renamed Love to Favorite and the old `loved`
 property now raises `-10001`. `music.py` prefers `favorited` and falls back.
+
+**Every song brings its own colour.** Once a cover is decoded, `art.accent`
+bins its pixels by hue, weights them towards saturated mid-tones — the red of
+a logo, not the brown of a shadow — and lifts the winner until it reads well as
+text. That colour then paints the progress bar, the playing marker and the
+lyric being sung. A grey cover has no accent and the default green stays. The
+artwork is pulled out of Music once per track and every size (the player's
+mini cover, the big one) is drawn from that one copy; the request carries the
+track's persistent ID, so a cover can never be filed under the wrong song.
+`LAZYMUSIC_MINI_ART=off` hides the mini cover.
 
 **Cover art without an image protocol.** Alacritty, Terminal.app and most of
 what people run this under support none of sixel, the kitty graphics protocol
@@ -332,9 +382,15 @@ library the property is empty for every track. When the tags are empty,
 holding an LRC transcript with a timestamp per line, which is what lets the
 panel highlight the line currently being sung and scroll itself. Search results
 are picked by closest duration, since relevance ordering happily returns a live
-cut or a remix first. This is the only part of lazymusic that touches the
-network; `LAZYMUSIC_LYRICS=tags` keeps everything local and `=off` disables
-lyrics entirely.
+cut or a remix first. Catalogue titles rarely match LRCLIB's exactly —
+`Kun Faya Kun (From "Rockstar")` by `A.R. Rahman, Javed Ali & Mohit Chauhan` is
+`Kun Faya Kun` by `A.R. Rahman` there — so a miss is retried with the
+decorations (`(From …)`, `(feat. …)`, `- Remastered`) and the extra artists
+stripped, then as free text. LRC ID tags (`[ar:]`, `[ti:]`) are dropped rather
+than sung, `[offset:]` is honoured, and word-level `<mm:ss>` stamps are
+removed. This is the only part of lazymusic that touches the network;
+`LAZYMUSIC_LYRICS=tags` keeps everything local and `=off` disables lyrics
+entirely.
 
 **Records, not properties.** `properties of current track` fetches the whole
 record in one event; reading each field separately cost a round trip apiece and
@@ -346,8 +402,10 @@ always fewer calls, not cheaper ones.
 
 Measured on a 1,267-track library: roughly **2.6% of one core when paused,
 4.5% when playing, 28MB resident**. State is polled once a second while playing
-and every three seconds when nothing is moving; identical frames are not
-repainted.
+and every three seconds when nothing is moving. A frame takes under a
+millisecond to compose, and only the rows that changed are written — so the
+equaliser costs one short row five times a second, not a whole screen. Plain
+ASCII skips the Unicode width tables entirely, and the rest is cached.
 
 Music.app does not notify anyone when the library changes, so a song you add
 while lazymusic is open cannot appear on its own. Cached track lists expire
@@ -367,6 +425,6 @@ falls back to LRCLIB). Both are explained under *How it works*.
 ## Development
 
 ```sh
-python3 -m unittest discover tests   # 178 tests, no Music.app needed
+python3 -m unittest discover tests   # 223 tests, no Music.app needed
 python3 -m lazymusic status          # run without installing
 ```

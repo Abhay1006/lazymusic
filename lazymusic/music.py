@@ -320,20 +320,29 @@ set c1 to (persistent ID of %(sel)s) as text
 set c2 to (name of %(sel)s) as text
 set c3 to (artist of %(sel)s) as text
 set c4 to (album of %(sel)s) as text
-return c1 & (character id 30) & c2 & (character id 30) & c3 & (character id 30) & c4
+-- Durations are a nicety for the track list, so a library that will not hand
+-- them over in bulk costs the column, not the whole read.
+set c5 to ""
+try
+    set c5 to (duration of %(sel)s) as text
+end try
+return c1 & (character id 30) & c2 & (character id 30) & c3 & (character id 30) & c4 & (character id 30) & c5
 """
 
 
 def _columns(selector, setup="", timeout=90.0):
-    """Fetch id/name/artist/album for a track selector and zip them into Tracks."""
+    """Fetch id/name/artist/album/duration for a selector and zip them into Tracks."""
     out = tell(_COLUMNS % {"sel": selector, "setup": setup}, timeout=timeout)
     cols = out.split(GROUP)
     if len(cols) < 4 or not cols[0]:
         return []
     ids, names, artists, albums = (col.split(SEP) for col in cols[:4])
+    durations = cols[4].split(SEP) if len(cols) > 4 and cols[4] else []
+    if len(durations) != len(ids):
+        durations = [""] * len(ids)
     return [
-        Track(pid=i, name=n, artist=a, album=al)
-        for i, n, a, al in zip(ids, names, artists, albums)
+        Track(pid=i, name=n, artist=a, album=al, duration=_num(du))
+        for i, n, a, al, du in zip(ids, names, artists, albums, durations)
     ]
 
 
@@ -361,8 +370,20 @@ def play_track(pid):
 # the `data` property would hand back a PICT-wrapped copy instead, which nothing
 # outside Carbon can read. The file is opened, truncated and closed inside the
 # one script so the handle cannot outlive a failure.
+#
+# The persistent ID is checked first: the request is made for a particular song,
+# and if Music has moved on by the time it runs, the cover would otherwise be
+# filed under the wrong track.
 _ARTWORK = """
 set p to %s
+set want to %s
+if want is not "" then
+    try
+        if (persistent ID of current track) is not want then return "-moved-"
+    on error
+        return "-moved-"
+    end try
+end if
 set n to 0
 try
     set n to (count of artworks of current track)
@@ -383,14 +404,18 @@ end try
 return (format of artwork 1 of current track) as text
 """
 
+MOVED = None
 
-def save_artwork(path):
-    """Write the current track's cover art to `path`. Returns "" if it has none.
 
-    Roughly 160ms for a 600x600 cover, so this belongs on the Bus rather than
-    the draw loop. Callers cache the result against the track's persistent ID.
+def save_artwork(path, pid=""):
+    """Write the current track's cover art to `path`.
+
+    Returns its format, "" if the track has no cover, or `MOVED` (None) if `pid`
+    is given and is no longer what is playing. Roughly 160ms for a 600x600
+    cover, so this belongs on the Bus rather than the draw loop.
     """
-    return tell(_ARTWORK % lit(path), timeout=20.0).strip()
+    out = tell(_ARTWORK % (lit(path), lit(pid)), timeout=20.0).strip()
+    return MOVED if out == "-moved-" else out
 
 
 def current_lyrics():
@@ -405,6 +430,26 @@ def current_lyrics():
                 'on error\n'
                 '    return ""\n'
                 'end try')
+
+
+def track_lyrics(pid):
+    """Tagged lyrics of the track `pid`, which is usually the one playing.
+
+    Reading `current track` is a single cheap event, so that is tried first; the
+    library lookup by ID only runs if playback has moved on since the request.
+    """
+    if not pid:
+        return current_lyrics()
+    return tell('set want to %s\n'
+                'try\n'
+                '    set t to current track\n'
+                '    if (persistent ID of t) is not want then\n'
+                '        set t to (first track of library playlist 1 whose persistent ID is want)\n'
+                '    end if\n'
+                '    return (lyrics of t)\n'
+                'on error\n'
+                '    return ""\n'
+                'end try' % lit(pid))
 
 
 # --------------------------------------------------------------- playlists ----
@@ -534,6 +579,7 @@ __all__ = [
     "ensure_running", "is_running", "launch", "next_track", "nudge_volume", "pause", "play", "play_playlist",
     "play_track", "play_track_in_playlist", "playlist_tracks", "playlists",
     "prev_track", "search", "seek", "save_artwork", "current_lyrics",
+    "track_lyrics", "MOVED",
     "QUEUE", "queue_add", "queue_clear", "queue_exists", "queue_remove",
     "queue_tracks", "queue_remove_pid", "play_queue",
     "set_loved", "set_repeat", "set_shuffle", "set_volume", "status", "stop",

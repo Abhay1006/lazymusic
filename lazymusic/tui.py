@@ -9,10 +9,15 @@ by side, so everything big goes there rather than into a column of its own: the
 track list, search results, the cover, lyrics, the queue and the key sheet all
 take it over in turn. `VIEW_LANE` maps each of those to the lane it scrolls.
 
-Frames are composed as whole rows and written home-cursor-first with per-line
-erases rather than a screen clear, so the display never flickers.
+Frames are composed as whole rows, and only the rows that changed since the
+last frame are written - each placed with an absolute cursor move, inside a
+synchronized update, so the display never flickers. Every panel border is
+anchored the same way (see `fmt.box`), which is what keeps the layout standing
+when a title or a lyric is in a script the terminal measures differently.
 """
 
+import codecs
+import math
 import os
 import queue
 import select
@@ -24,14 +29,29 @@ import termios
 import threading
 import time
 import tty
+import unicodedata
 
 from . import art, lyrics, music
-from .fmt import bar, box, mmss, pad, row, truncate, width_of
+from .fmt import (Line, Tab, box, clean, fg, mmss, pad, row, truncate, widest,
+                  width_of, wrap)
 from .osa import MusicError
 
 ALT_ON, ALT_OFF = "\033[?1049h", "\033[?1049l"
 CUR_HIDE, CUR_SHOW = "\033[?25l", "\033[?25h"
-HOME, CLR_EOL, CLR_EOS = "\033[H", "\033[K", "\033[J"
+CLR_EOL, CLR_ALL = "\033[K", "\033[2J"
+# Autowrap off: a row the terminal draws wider than we measured must be clipped
+# at the right edge, not wrapped onto the next row - wrapping on the bottom row
+# scrolls the whole screen and takes the top border with it.
+WRAP_OFF, WRAP_ON = "\033[?7l", "\033[?7h"
+# Synchronized output (DEC mode 2026): the terminal holds the frame until it is
+# complete. Terminals that do not know the mode ignore it.
+SYNC_ON, SYNC_OFF = "\033[?2026h", "\033[?2026l"
+
+SELECTED_BG = "48;5;236"   # the band behind the cursor row in a focused panel
+EQ_BARS = "▁▂▃▄▅▆▇"         # the little equaliser beside whatever is playing
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+# Bus jobs worth a spinner on the key bar; the status poll is not one of them.
+SLOW_JOBS = ("search", "tracks", "playlists", "playquery", "lyrics", "queue")
 
 FRAME = 0.2       # seconds between repaints
 STATE_PLAYING = 1.0  # seconds between state reads while playing
@@ -70,6 +90,7 @@ ART_MAX = 12       # above this it stops looking intentional
 ART_GUTTER = 2     # blank columns between the cover and the details beside it
 ART_TEXT_MIN = 18  # if the details cannot get this much width, drop the cover
 CACHE_KEEP = 24   # covers and lyrics held in memory before the oldest is dropped
+MINI_ART_TEXT = 22  # the player's mini cover needs this much width left beside it
 
 
 def art_rows_for(height, inner):
@@ -110,6 +131,10 @@ HELP_LEFT = [
     ("QUEUE", ""),
     ("A", "queue this track"),
     ("D", "remove from queue"),
+    ("", ""),
+    ("LYRICS", ""),
+    ("enter", "sing from this line"),
+    ("j / k", "scroll (stops following)"),
 ]
 
 HELP_RIGHT = [
@@ -120,6 +145,7 @@ HELP_RIGHT = [
     ("*", "search artist under cursor"),
     ("ctrl-o", "back to previous view"),
     ("R", "reload library from Music"),
+    ("ctrl-l", "redraw the screen"),
     ("", ""),
     ("PLAYBACK", ""),
     ("space", "play / pause"),
@@ -147,6 +173,8 @@ HELP_COMMANDS = [
     (":art :lyrics :upnext", ""),
     (":art test", "which glyphs render"),
     (":upnext clear", "empty the queue"),
+    (":sleep 30 | off", "pause in 30 minutes"),
+    (":offset +0.5", "lyrics later; bare resets"),
     (":reload", "re-read the library"),
     (":42", "jump to row 42"),
     (":help", "this panel"),
@@ -162,6 +190,9 @@ class Keys:
     def __init__(self, stream=sys.stdin):
         self.fd = stream.fileno()
         self._saved = None
+        # A read can end in the middle of a multi-byte character (typing Hindi
+        # into a filter does this); the decoder holds the partial bytes over.
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
 
     def __enter__(self):
         self._saved = termios.tcgetattr(self.fd)
@@ -175,7 +206,9 @@ class Keys:
     def poll(self, timeout):
         if not select.select([self.fd], [], [], timeout)[0]:
             return []
-        data = os.read(self.fd, 1024).decode("utf-8", "replace")
+        return self.decode(self._decoder.decode(os.read(self.fd, 1024)))
+
+    def decode(self, data):
         keys, i = [], 0
         while i < len(data):
             ch = data[i]
@@ -202,6 +235,11 @@ class Keys:
     @staticmethod
     def _escape(data, i):
         """Decode one escape sequence starting at `i`; return (name, length)."""
+        if data[i + 1:i + 2] == "O" and i + 2 < len(data):
+            # SS3: what arrows and home/end send in application cursor mode.
+            # Read as two plain keys, `ESC O A` would queue a track (`A`).
+            return {"A": "up", "B": "down", "C": "right", "D": "left",
+                    "H": "home", "F": "end"}.get(data[i + 2], "unknown"), 3
         if data[i + 1:i + 2] != "[":
             return "esc", 1
         j = i + 2
@@ -222,33 +260,47 @@ class Keys:
 
 
 class Bus:
-    """Runs Music.app calls on a worker thread so the UI never blocks on them.
+    """Runs Music.app calls on worker threads so the UI never blocks on them.
 
     Every osascript round trip costs 70-150ms. Doing that on the draw loop meant
     the interface froze for a sizeable slice of every second, which is what made
     keystrokes feel like they arrived late. Jobs go out on a queue and results
     come back on another, applied by the UI thread in `drain` - so callbacks
     still run single-threaded and nothing needs a lock.
+
+    Slow work gets a lane of its own. A lyrics lookup can sit on the network for
+    several seconds, and on a single worker every play/pause pressed in that
+    time waited behind it; the cover is the same story at a smaller scale. Jobs
+    are routed by the prefix of their key, so callers never have to say.
     """
 
+    LANES = {"lyrics": "net", "art": "art"}
+
     def __init__(self):
-        self.jobs = queue.Queue()
         self.results = queue.Queue()
         self.inflight = set()
-        self.worker = threading.Thread(target=self._loop, daemon=True)
-        self.worker.start()
+        self._lanes = {}
 
     def submit(self, key, call, then=None):
         """Queue `call`. A key already in flight is dropped, not stacked up."""
         if key in self.inflight:
             return False
         self.inflight.add(key)
-        self.jobs.put((key, call, then))
+        self._lane(self.LANES.get(key.split(":")[0], "music")).put(
+            (key, call, then))
         return True
 
-    def _loop(self):
+    def _lane(self, name):
+        jobs = self._lanes.get(name)
+        if jobs is None:
+            jobs = self._lanes[name] = queue.Queue()
+            threading.Thread(target=self._loop, args=(jobs,), daemon=True,
+                             name="lazymusic-%s" % name).start()
+        return jobs
+
+    def _loop(self, jobs):
         while True:
-            key, call, then = self.jobs.get()
+            key, call, then = jobs.get()
             try:
                 self.results.put((key, then, call(), None))
             except MusicError as e:
@@ -273,6 +325,19 @@ class Bus:
     def busy(self):
         return bool(self.inflight)
 
+    def loading(self, names=SLOW_JOBS):
+        """True while a job the user is waiting on is still out."""
+        return any(key.split(":")[0] in names for key in self.inflight)
+
+
+def fold(text):
+    """`text` lower-cased with its accents dropped, for forgiving matching."""
+    text = text.casefold()
+    if text.isascii():
+        return text
+    return "".join(ch for ch in unicodedata.normalize("NFKD", text)
+                   if not unicodedata.combining(ch))
+
 
 class Lane:
     """One scrollable list: the rows, which is selected, and what is on screen.
@@ -282,6 +347,7 @@ class Lane:
 
     def __init__(self, label=lambda item: str(item)):
         self.all_items = []
+        self._folded = None       # lower-cased, accent-free labels, built lazily
         self.items = []
         self.cursor = 0
         self.scroll = 0
@@ -290,15 +356,24 @@ class Lane:
 
     def set_items(self, items):
         self.all_items = list(items)
+        self._folded = None
         self.apply_filter(self.filter)
 
     def apply_filter(self, text):
+        """Keep the items matching every word of `text`, in any order.
+
+        Matching ignores case and accents, so `beyonce` finds Beyoncé and
+        `satie gymno` finds Gymnopédie No. 1 by Erik Satie.
+        """
         self.filter = text
-        if not text:
+        words = fold(text).split()
+        if not words:
             self.items = list(self.all_items)
             return
-        needle = text.lower()
-        self.items = [i for i in self.all_items if needle in self.label(i).lower()]
+        if self._folded is None or len(self._folded) != len(self.all_items):
+            self._folded = [fold(self.label(i)) for i in self.all_items]
+        self.items = [item for item, hay in zip(self.all_items, self._folded)
+                      if all(w in hay for w in words)]
         self.cursor = min(self.cursor, max(0, len(self.items) - 1))
 
     def move(self, delta, view):
@@ -368,16 +443,25 @@ class App:
         self.main_title = "Tracks"
         self.main_playlist = ""   # playlist the main panel is showing, if any
         self.message = ""
+        self.message_kind = "info"  # "info", "ok" or "error": sets the colour
         self.message_until = 0.0
         self.running = True
         self._views = {}          # panel -> visible row count, set while drawing
+        self._origin = {}         # panel -> screen column, set while drawing
         self._last_state = 0.0
         self._pos_at = 0.0
         self._pending = None      # (playlist_name, load_after_monotonic)
         self._cache = {}          # playlist name -> (fetched_at, tracks)
-        self._last_frame = ""
+        self._screen = []         # the rows last written, for diffing
+        self._size = None         # terminal size those rows were drawn for
+        self._title_sent = None   # the window title last written
         self._completions = []    # tab-completion candidates on the `:` line
-        self._art = {}            # (persistent ID, rows) -> rendered cover rows
+        self._art = {}            # (persistent ID, rows, glyph) -> cover rows
+        self._accent = {}         # persistent ID -> (r, g, b) or None
+        self._art_src = ""        # track whose artwork is saved in scratch (art lane only)
+        self._lyric_delay = 0.0   # seconds the lyric runs behind the music (:offset)
+        self._lyric_layout = (None, [], [])  # (key, wrapped rows, first row per line)
+        self._sleep_at = 0.0      # monotonic time the sleep timer pauses at
         self._lyrics = {}         # persistent ID -> Lyrics
         self._lyric_pid = ""      # track the lyrics lane is currently holding
         self._follow = True       # lyrics scroll with playback until you scroll
@@ -412,7 +496,7 @@ class App:
     def load_playlists(self, then=None):
         def done(items, err):
             if err:
-                self.notify(str(err))
+                self.fail(err)
                 return
             lane = self.lanes[PLAYLISTS]
             lane.set_items(items)
@@ -445,7 +529,7 @@ class App:
 
     def _got_status(self, state, err):
         if err:
-            self.notify(str(err))
+            self.fail(err)
             return
         before_pid = self.state.track.pid
         before_playlist = self.state.playlist
@@ -461,6 +545,7 @@ class App:
         it cannot know the height until it knows how big the panel came out.
         """
         self._follow = True
+        self._lyric_delay = 0.0
         # A queued track that has played has done its job. Dropping it here is
         # what makes the queue drain as it goes rather than replaying from the
         # top the next time it starts. Queued first, so the refresh below reads
@@ -469,7 +554,7 @@ class App:
             self.bus.submit("drain",
                             lambda: music.queue_remove_pid(before_pid),
                             self._drained)
-        if self.view == V_LYRICS:
+        if self.view in (V_LYRICS, V_ART) and lyrics.mode() != "off":
             self.want_lyrics()
         if self.view == V_QUEUE:
             self.want_queue()
@@ -478,7 +563,7 @@ class App:
 
     def _drained(self, _value, err):
         if err:
-            self.notify(str(err))
+            self.fail(err)
 
     @property
     def position(self):
@@ -487,9 +572,24 @@ class App:
         return min(self.state.track.duration or 1e9,
                    self.state.position + (time.monotonic() - self._pos_at))
 
-    def notify(self, text, seconds=2.5):
+    def notify(self, text, seconds=2.5, kind="info"):
         self.message = text
+        self.message_kind = kind
         self.message_until = time.monotonic() + seconds
+
+    def fail(self, err):
+        """Put an error on the key bar, in red and for long enough to read."""
+        self.notify(str(err), 4.0, "error")
+
+    @property
+    def tone(self):
+        """The accent colour: picked from the cover when there is one.
+
+        It paints the progress bar, the playing marker and the line being sung,
+        so the whole interface takes on the colours of each song as it plays.
+        """
+        rgb = self._accent.get(self.state.track.pid)
+        return fg(*rgb) if rgb else "brightgreen"
 
     def act(self, fn, *args):
         """Send a command, then re-read state. Both run on the worker thread.
@@ -502,7 +602,7 @@ class App:
 
     def _acted(self, _value, err):
         if err:
-            self.notify(str(err))
+            self.fail(err)
         self._last_state = 0.0          # pull fresh state on the next tick
         self.refresh(force=True)
 
@@ -534,7 +634,7 @@ class App:
 
         def done(tracks, err):
             if err:
-                self.notify(str(err))
+                self.fail(err)
                 return
             self._cache[name] = (time.monotonic(), tracks)
             # The cursor may have moved on while this was in flight; only paint
@@ -591,34 +691,46 @@ class App:
         Called from the draw path, which is the only place the panel height is
         known. `submit` drops a duplicate key, so asking every frame queues one
         job; an empty result is cached too, so a track with no cover is not
-        re-fetched on every repaint.
+        re-fetched on every repaint. The artwork is pulled out of Music once per
+        track and every size is drawn from that one copy.
         """
+        if not art.color_enabled():
+            return
         pid = self.state.track.pid
         # The glyph decides how many pixels a row holds, so it belongs in the
         # key: switching it must not hand back the old rendering.
-        key = (pid, rows, art.glyph_mode())
+        mode = art.glyph_mode()
+        key = (pid, rows, mode)
         if not pid or key in self._art:
             return
         source = os.path.join(self._scratch, "cover")
-        decoded = os.path.join(self._scratch, "cover.bmp")
+        decoded = os.path.join(self._scratch, "cover-%d.bmp" % rows)
 
         def job():
-            if not music.save_artwork(source):
-                return []
-            return art.render(source, rows, decoded)
+            # Runs on the art lane, which is serial, so `_art_src` needs no lock.
+            if self._art_src != pid:
+                saved = music.save_artwork(source, pid)
+                if saved is music.MOVED:
+                    return None             # asked again on the next frame
+                self._art_src = pid if saved else ""
+                if not saved:
+                    return [], None
+            return art.cover(source, rows, decoded, mode)
 
         def done(value, err):
             if err:
-                self.notify(str(err))
+                self.fail(err)
+                value = ([], None)      # cache the miss rather than retry forever
+            if value is None:
                 return
-            # `save_artwork` reads whatever is playing when it runs, so a track
-            # change mid-flight would file the new cover under the old song.
-            if self.state.track.pid != pid:
-                return
-            self._art[key] = value
+            cover, colour = value
+            self._art[key] = cover
             self._trim(self._art)
+            if pid not in self._accent or colour:
+                self._accent[pid] = colour
+                self._trim(self._accent)
 
-        self.bus.submit("art", job, done)
+        self.bus.submit("art:%d" % rows, job, done)
 
     def want_lyrics(self):
         track = self.state.track
@@ -630,7 +742,7 @@ class App:
                 # A lyric that cannot be found is not worth an error row; note
                 # it on the key bar and cache the miss so it is asked for once.
                 self._lyrics[track.pid] = lyrics.Lyrics()
-                self.notify("lyrics: %s" % err)
+                self.notify("lyrics: %s" % err, 3.0, "error")
             else:
                 self._lyrics[track.pid] = value
             self._trim(self._lyrics)
@@ -656,7 +768,7 @@ class App:
 
         def done(value, err):
             if err:
-                self.notify(str(err))
+                self.fail(err)
                 return
             kind, tracks = value
             self._queue_kind = kind
@@ -678,7 +790,7 @@ class App:
         """
         def done(value, err):
             if err:
-                self.notify(str(err))
+                self.fail(err)
                 return
             self._queue_items = list(value)
         self.bus.submit("queueitems", music.queue_tracks, done)
@@ -761,6 +873,21 @@ class App:
 
     RESTORE_TRIES = 12          # about a minute of trying, then let it go
 
+    def sleep_left(self):
+        """Time left on the sleep timer as `25m` or `40s`, or None if unset."""
+        if not self._sleep_at:
+            return None
+        left = max(0, int(self._sleep_at - time.monotonic()))
+        return "%dm" % ((left + 59) // 60) if left >= 60 else "%ds" % left
+
+    def tick_sleep(self):
+        """Pause when the sleep timer runs out."""
+        if self._sleep_at and time.monotonic() >= self._sleep_at:
+            self._sleep_at = 0.0
+            if self.state.playing:
+                self.act(music.pause)
+            self.notify("sleep timer: paused. good night ☾", 6.0, "ok")
+
     def restore_shuffle(self):
         """Put shuffle back once the queue is no longer what is playing.
 
@@ -789,9 +916,9 @@ class App:
         """Add `track` to the queue playlist, creating it on first use."""
         def done(_value, err):
             if err:
-                self.notify(str(err))
+                self.fail(err)
                 return
-            self.notify("queued %s" % track.label)
+            self.notify("queued %s" % track.label, kind="ok")
             self.after_queue_change(start_if_idle=True)
         # Keyed by track: `submit` drops a key already in flight, and queueing
         # several songs in quick succession must not lose all but the first.
@@ -802,7 +929,7 @@ class App:
         """Re-read the queue, and refresh the panel if it is the one showing."""
         def then(value, err):
             if err:
-                self.notify(str(err))
+                self.fail(err)
                 return
             self._queue_items = list(value)
             if self.view == V_QUEUE:
@@ -827,9 +954,9 @@ class App:
 
         def done(_value, err):
             if err:
-                self.notify(str(err))
+                self.fail(err)
                 return
-            self.notify("removed %s" % track.label)
+            self.notify("removed %s" % track.label, kind="ok")
             self.after_queue_change()
         self.bus.submit("dequeue:%d" % index,
                         lambda: music.queue_remove(index), done)
@@ -844,69 +971,187 @@ class App:
 
     # ------------------------------------------------------------- draw ----
 
-    def render(self):
-        cols, rows = shutil.get_terminal_size((90, 28))
-        cols, rows = max(60, cols), max(14, rows)
+    def compose(self, cols, rows):
+        """Every screen row of a `cols` x `rows` frame, each anchored in place."""
         height = rows - 1                       # last row is the key bar
         left_w = max(30, min(46, cols * 38 // 100))
         right_w = cols - left_w
-
         player_h = min(PLAYER_HEIGHT, max(3, height - 5))
+        self._origin = {PLAYER: 0, PLAYLISTS: 0, TRACKS: left_w}
 
         left = []
         left += self.panel_player(left_w, player_h)
         left += self.panel_list(PLAYLISTS, left_w, height - player_h)
-        left = left[:height] + [" " * left_w] * max(0, height - len(left))
+        left = left[:height] + ["\033[1G" + " " * left_w] * max(0, height - len(left))
         right = self.panel_main(right_w, height)
 
         lines = [l + r for l, r in zip(left, right)]
-        lines.append(self.key_bar(cols))
+        # The key bar is the one row not drawn as a box, so it is cleared to
+        # the edge instead: a message can be shorter than the one before it.
+        lines.append(self.key_bar(cols) + CLR_EOL)
+        return lines[:rows]
 
-        # The last row gets no trailing newline. Writing one on the bottom line
-        # scrolls the whole grid up, which silently eats the top border.
-        visible = lines[:rows]
-        out = [HOME, (CLR_EOL + "\r\n").join(visible), CLR_EOL, CLR_EOS]
-        frame = "".join(out)
-        if frame == self._last_frame:
+    def render(self):
+        cols, rows = shutil.get_terminal_size((90, 28))
+        cols, rows = max(60, cols), max(14, rows)
+        lines = self.compose(cols, rows)
+        out = []
+        if (cols, rows) != self._size:
+            # A resize leaves the old frame smeared across the new grid.
+            self._size, self._screen = (cols, rows), []
+            out.append(CLR_ALL)
+        title = self.window_title()
+        if title != self._title_sent:
+            self._title_sent = title
+            out.append("\033]2;%s\007" % title)
+        # Only rows that changed are sent, each placed by an absolute cursor
+        # move. Nothing is ever written with a newline, so the bottom row can
+        # never scroll the screen and eat the top border.
+        for y, line in enumerate(lines):
+            if y < len(self._screen) and self._screen[y] == line:
+                continue
+            out.append("\033[%d;1H%s" % (y + 1, line))
+        self._screen = lines
+        if not out:
             return                      # nothing changed; skip the repaint
-        self._last_frame = frame
-        sys.stdout.write(frame)
+        sys.stdout.write(SYNC_ON + "".join(out) + SYNC_OFF)
         sys.stdout.flush()
+
+    def window_title(self):
+        """What the terminal tab says: the song, so it can be seen from afar."""
+        track = self.state.track
+        if self.state.stopped or not track:
+            return WindowName.NAME
+        icon = "▶" if self.state.playing else "⏸"
+        return clean("%s %s" % (icon, track.label))
+
+    def frame(self, panel, width, height, title, body, footer="", focused=None):
+        """A bordered panel, anchored at the column `compose` placed it in."""
+        if focused is None:
+            focused = self.focus == panel
+        return box(width, height, title, body, focused=focused, footer=footer,
+                   x=self._origin.get(panel))
+
+    # -- little pieces shared by the panels -----------------------------------
+
+    def spinner(self):
+        return SPINNER[int(time.monotonic() * 10) % len(SPINNER)]
+
+    def equaliser(self):
+        """Three bouncing bars while playing, flat while paused.
+
+        Music.app gives no audio levels, so this is decoration rather than a
+        meter - but it says at a glance which row is the one playing.
+        """
+        if not self.state.playing:
+            return "▁▁▁"
+        now, top = time.monotonic(), len(EQ_BARS) - 1
+        return "".join(EQ_BARS[int((math.sin(now * speed + phase) + 1) / 2 * top + 0.5)]
+                       for speed, phase in ((7.1, 0.0), (9.7, 1.9), (5.3, 3.7)))
+
+    def progress(self, width):
+        """Elapsed time, a bar with a playhead, and the length, in `width` columns."""
+        track = self.state.track
+        elapsed, total = mmss(self.position), mmss(track.duration)
+        bar_w = max(6, width - len(elapsed) - len(total) - 2)
+        frac = (self.position / track.duration) if track.duration else 0.0
+        head = int(round(min(1.0, max(0.0, frac)) * (bar_w - 1)))
+        return [(elapsed, "grey"), (" ",), ("━" * head, self.tone),
+                ("●", self.tone, "bold"), ("─" * (bar_w - head - 1), "grey"),
+                (" ",), (total, "grey")]
+
+    def flags(self):
+        st, track = self.state, self.state.track
+        repeat = "repeat" if st.repeat == "off" else "repeat " + st.repeat
+        segs = [("⇄ shuffle", self.tone if st.shuffle else "grey"), ("  ",),
+                ("↻ " + repeat, self.tone if st.repeat != "off" else "grey"),
+                ("  ",),
+                ("♥", "brightred") if track.loved else ("♡", "grey")]
+        return segs
+
+    def volume(self, cells=10):
+        level = max(0, min(100, self.state.volume))
+        filled = int(round(level / 100.0 * cells))
+        segs = [("vol ", "grey"), ("▪" * filled, self.tone),
+                ("·" * (cells - filled), "grey"), (" %d%%" % level, "grey")]
+        left = self.sleep_left()
+        if left is not None:
+            segs.append(("   ☾ %s" % left, "yellow"))
+        return segs
+
+    def now_playing(self, width, compact=False):
+        """The track details: five rows for the player, more for the cover view."""
+        st, track = self.state, self.state.track
+        icon, tone = ("▶", self.tone) if st.playing else ("⏸", "yellow")
+        if compact:
+            return [
+                [(icon, tone), (" ",), (truncate(track.name, max(4, width - 6)), "bold"),
+                 (" ",), (self.equaliser(), self.tone)],
+                [("  ",), (track.artist, "white")],
+                self.progress(width),
+                self.flags(),
+                self.volume(),
+            ]
+        names = wrap(track.name, width) or [""]
+        if len(names) > 2:
+            names = [names[0], truncate(" ".join(names[1:]), width)]
+        # Singles are routinely tagged with the album named after the track, and
+        # printing the same words twice just eats a row.
+        album = "" if track.album.strip() == track.name.strip() else track.album
+        out = [[(name, "bold")] for name in names]
+        out += [[(track.artist, "white")], [(album, "grey")], [],
+                [(icon + " ", tone)] + self.progress(width - 2),
+                self.flags(), [], self.volume()]
+        if self._queue_items:
+            out += [[], [("next  ", "grey"), (self._queue_items[0].label, "white")]]
+        return out
+
+    # -- the left stack --------------------------------------------------------
+
+    def mini_art_rows(self, inner, rows):
+        """How tall the player's own little cover is, or 0 to leave it out."""
+        if not art.color_enabled() or rows < 3:
+            return 0
+        if os.environ.get("LAZYMUSIC_MINI_ART", "").strip().lower() in ("0", "off", "no"):
+            return 0
+        if inner - (rows * 2 + 3) < MINI_ART_TEXT:
+            return 0
+        if self._art.get((self.state.track.pid, rows, art.glyph_mode())) == []:
+            return 0                    # known to have no cover: take the room back
+        return rows
 
     def panel_player(self, width, height):
         st = self.state
-        inner = width - 2
+        inner, rows = width - 2, height - 2
         body = []
         if not st.running:
-            body.append([("  Music.app is starting…", "grey")])
+            body.append([("  ",), (self.spinner() + " Music.app is starting…", "grey")])
         elif st.stopped:
-            body.append([("  Nothing playing", "grey")])
-            body.append([])
-            body.append([("  Pick a playlist and press ", "grey"), ("enter", "bold")])
+            body += [[], [("  ■  nothing playing", "grey")], [],
+                     [("  pick a playlist and press ", "grey"), ("enter", "bold")]]
+            if self._queue_items:
+                body.append([("  or ", "grey"), (":upnext play", "bold"),
+                             (" for the %d queued" % len(self._queue_items), "grey")])
         else:
-            t = st.track
-            icon, tone = ("▶", "brightgreen") if st.playing else ("⏸", "yellow")
-            body.append([("  ", ), (icon, tone), ("  ", ), (t.name, "bold")])
-            body.append([("     ", ), (t.artist, "white")])
-
-            elapsed, total = mmss(self.position), mmss(t.duration)
-            bw = max(6, inner - width_of(elapsed) - width_of(total) - 8)
-            frac = (self.position / t.duration) if t.duration else 0.0
-            body.append([("   ", ), (elapsed, "grey"), (" ", ),
-                         (bar(frac, bw), "brightgreen"), (" ", ), (total, "grey")])
-
-            flags = [("shuffle", st.shuffle), ("repeat %s" % st.repeat,
-                                               st.repeat != "off"),
-                     ("♥", t.loved)]
-            segs = [("   ", )]
-            for name, on in flags:
-                segs.append((name + "  ", "brightcyan" if on else "grey"))
-            body.append(segs)
-            body.append([("   ", ),
-                         ("vol %s %d%%" % (bar(st.volume / 100.0, 10, "▪", "·", "▪"),
-                                           st.volume), "grey")])
-        return box(width, height, self.title_for(PLAYER), body,
-                   focused=self.focus == PLAYER)
+            mini = self.mini_art_rows(inner, rows)
+            cover = None
+            if mini:
+                cover = self._art.get((st.track.pid, mini, art.glyph_mode()))
+                if cover is None:
+                    self.want_art(mini)
+            text_x = mini * 2 + 3 if mini else 2
+            details = self.now_playing(inner - text_x - 1, compact=True)
+            for i in range(rows):
+                line = [(" ",)]
+                if mini and cover:
+                    line.append((cover[i],) if i < len(cover) else (" " * mini * 2,))
+                elif mini and i == mini // 2:
+                    line.append((pad(self.spinner().center(mini * 2), mini * 2), "grey"))
+                line.append((Tab(text_x),))
+                if i < len(details):
+                    line += details[i]
+                body.append(line)
+        return self.frame(PLAYER, width, height, self.title_for(PLAYER), body)
 
     def title_for(self, panel):
         title = "%d %s" % (panel, TITLES[panel])
@@ -925,39 +1170,42 @@ class App:
         inner = width - 2
         body = []
         if not lane.items:
-            hint = "no playlists"
-            body.append([("  " + hint, "grey")])
+            if self.bus.loading(("playlists",)):
+                body.append([("  ",), (self.spinner() + " loading playlists…", "grey")])
+            else:
+                body.append([("  no playlists" if not lane.filter else "  no match", "grey")])
         else:
             # Column widths are settled once per panel, not per row - measuring
             # each row separately is what makes a list look ragged.
-            if panel == PLAYLISTS:
-                right_w = max([len(str(n)) for _, n in lane.items] + [3])
-            else:
-                right_w = max(10, min(26, inner // 3))
-            right_w = min(right_w, max(0, inner - 8))
+            count_w = max(len(str(n)) for _, n in lane.items)
             for i in range(lane.scroll, min(len(lane.items), lane.scroll + view)):
-                body.append(self.list_row(panel, lane.items[i], i, lane, inner,
-                                          focused, right_w))
+                body.append(self.list_row(lane.items[i], i == lane.cursor,
+                                          focused, inner, count_w))
         footer = ""
         if len(lane.items) > view:
             footer = "%d/%d" % (lane.cursor + 1, len(lane.items))
-        return box(width, height, self.title_for(panel), body, focused=focused,
-                   footer=footer)
+        return self.frame(panel, width, height, self.title_for(panel), body,
+                          footer=footer)
 
-    def list_row(self, panel, item, index, lane, width, focused, right_w):
-        if panel == PLAYLISTS:
-            left, right = item[0], str(item[1]).rjust(right_w)
+    def list_row(self, item, selected, focused, inner, count_w):
+        """One playlist: a marker, its name, and its track count flush right."""
+        name, count = item
+        playing = name == self.state.playlist and not self.state.stopped
+        count_x = inner - count_w
+        name = truncate(name, max(4, count_x - 3))
+        mark = ("▸", "brightcyan", "bold") if selected else (
+            ("♪", self.tone) if playing else (" ",))
+        if selected and focused:
+            style = ("brightwhite", "bold")
+        elif selected:
+            style = ("cyan",)
         else:
-            left, right = item.name, truncate(item.artist, right_w)
-        left_w = max(4, width - right_w - 3)
-        selected = index == lane.cursor
-        mark = "▸ " if selected else "  "
-        left = pad(truncate(left, left_w), left_w)
-        if selected:
-            # A single padded span, so the highlight runs unbroken to the edge.
-            style = ("brightcyan", "bold") if focused else ("cyan",)
-            return [(pad(mark + left + " " + right, width),) + style]
-        return [(mark,), (left,), (" ",), (right, "grey")]
+            style = (self.tone, "bold") if playing else ()
+        segs = [mark, (Tab(2),), (name,) + style, (Tab(count_x),),
+                (str(count).rjust(count_w), "grey")]
+        return Line(segs, (SELECTED_BG,)) if selected and focused else segs
+
+    # -- the main panel ----------------------------------------------------------
 
     def panel_main(self, width, height):
         if self.view == V_HELP:
@@ -972,8 +1220,70 @@ class App:
 
     def main_box(self, width, height, title, body, footer=""):
         """Draw the main panel, numbered and bordered like the others."""
-        return box(width, height, "3 %s" % truncate(title, max(8, width - 24)),
-                   body, focused=self.focus == TRACKS, footer=footer)
+        return self.frame(TRACKS, width, height,
+                          "3 %s" % truncate(title, max(8, width - 24)), body,
+                          footer=footer)
+
+    def track_rows(self, lane, inner, view, focused):
+        """Rows of a track list: number, title, artist and length, in columns.
+
+        Each column starts at a `Tab`, so a title in a script the terminal
+        measures differently from us can only ever shift its own column.
+        """
+        items = lane.items
+        num_w = len(str(len(items)))
+        longest = max((t.duration for t in items), default=0)
+        dur_w = len(mmss(longest)) if longest else 0
+        artist_w = max(10, min(28, inner // 3))
+        name_x = num_w + 3
+        dur_x = inner - dur_w if dur_w else inner
+        artist_x = dur_x - artist_w - (2 if dur_w else 0)
+        if artist_x - name_x < 10:          # cramped: the lengths go first
+            dur_w, dur_x = 0, inner
+            artist_x = inner - artist_w
+        artist_w = dur_x - artist_x - (2 if dur_w else 0)
+        name_w = max(4, artist_x - name_x - 2)
+        playing_pid = "" if self.state.stopped else self.state.track.pid
+        eq = self.equaliser()[1]
+        out = []
+        for i in range(lane.scroll, min(len(items), lane.scroll + view)):
+            track = items[i]
+            selected = i == lane.cursor
+            playing = bool(playing_pid) and track.pid == playing_pid
+            band = selected and focused
+            if selected:
+                mark = ("▸", "brightcyan", "bold")
+            elif playing:
+                mark = (eq, self.tone)
+            else:
+                mark = (" ",)
+            if playing:
+                name_style, artist_style = (self.tone, "bold"), (self.tone,)
+            elif band:
+                name_style, artist_style = ("brightwhite", "bold"), ("white",)
+            elif selected:
+                name_style, artist_style = ("cyan",), ("cyan",)
+            else:
+                name_style, artist_style = (), ("grey",)
+            segs = [mark, (Tab(2),), (str(i + 1).rjust(num_w), "grey"),
+                    (Tab(name_x),), (truncate(track.name, name_w),) + name_style,
+                    (Tab(artist_x),), (truncate(track.artist, artist_w),) + artist_style]
+            if dur_w and track.duration:
+                segs += [(Tab(dur_x),), (mmss(track.duration).rjust(dur_w), "grey")]
+            out.append(Line(segs, (SELECTED_BG,)) if band else segs)
+        return out
+
+    @staticmethod
+    def list_footer(lane, view):
+        """`12/40` while the list scrolls, plus its running time when known."""
+        n = len(lane.items)
+        footer = "%d/%d" % (lane.cursor + 1, n) if n > view else ""
+        total = sum(getattr(t, "duration", 0) or 0 for t in lane.items)
+        if total >= 60:
+            hours, minutes = divmod(int(total) // 60, 60)
+            length = "%dh %02dm" % (hours, minutes) if hours else "%dm" % minutes
+            footer = "%s · %s" % (footer, length) if footer else length
+        return footer
 
     def panel_tracks(self, width, height):
         lane = self.lanes[TRACKS]
@@ -981,68 +1291,18 @@ class App:
         self._views[TRACKS] = view
         lane.clamp(view)
         focused = self.focus == TRACKS
-        body = []
-        if not lane.items:
-            body.append([("  nothing to show", "grey")])
+        if lane.items:
+            body = self.track_rows(lane, width - 2, view, focused)
+        elif self.bus.loading(("tracks", "search")):
+            body = [[("  ",), (self.spinner() + " loading…", "grey")]]
         else:
-            inner = width - 2
-            index_w = len(str(len(lane.items)))
-            right_w = min(max(12, inner // 3), max(0, inner - index_w - 12))
-            left_w = max(6, inner - right_w - index_w - 4)
-            for i in range(lane.scroll, min(len(lane.items), lane.scroll + view)):
-                t = lane.items[i]
-                selected = i == lane.cursor
-                playing = bool(self.state.track.pid) and t.pid == self.state.track.pid
-                num = str(i + 1).rjust(index_w)
-                mark = "▸" if selected else ("▶" if playing else " ")
-                name = pad(truncate(t.name, left_w), left_w)
-                artist = truncate(t.artist, right_w)
-                if selected:
-                    style = ("brightcyan", "bold") if focused else ("cyan",)
-                    text = "%s %s %s %s" % (mark, num, name, artist)
-                    body.append([(pad(text, inner),) + style])
-                elif playing:
-                    body.append([("%s %s %s %s" % (mark, num, name, artist),
-                                  "brightgreen")])
-                else:
-                    body.append([("%s %s " % (mark, num), "grey"), (name,),
-                                 (" ",), (artist, "grey")])
-        footer = ""
-        if len(lane.items) > view:
-            footer = "%d/%d" % (lane.cursor + 1, len(lane.items))
+            body = [[("  nothing to show" if not lane.filter else "  no match", "grey")]]
         title = "3 %s" % truncate(self.main_title, max(8, width - 24))
         if lane.filter:
             caret = "▏" if self.mode == FILTER and focused else ""
             title += "  /%s%s" % (lane.filter, caret)
-        return box(width, height, title, body, focused=focused, footer=footer)
-
-    def art_details(self, width):
-        """The track details that sit beside the cover, wrapped to `width`."""
-        state, track = self.state, self.state.track
-        icon, tone = ("▶", "brightgreen") if state.playing else ("⏸", "yellow")
-        elapsed, total = mmss(self.position), mmss(track.duration)
-        bar_w = max(6, width - width_of(elapsed) - width_of(total) - 6)
-        frac = (self.position / track.duration) if track.duration else 0.0
-        flags = []
-        for name, on in (("shuffle", state.shuffle),
-                         ("repeat %s" % state.repeat, state.repeat != "off"),
-                         ("♥", track.loved)):
-            flags.append((name + "  ", "brightcyan" if on else "grey"))
-        # Singles are routinely tagged with the album named after the track, and
-        # printing the same words twice just eats a row.
-        album = "" if track.album.strip() == track.name.strip() else track.album
-        return [
-            [(truncate(track.name, width), "bold")],
-            [(truncate(track.artist, width), "white")],
-            [(truncate(album, width), "grey")],
-            [],
-            [(icon + " ", tone), (elapsed, "grey"), (" ",),
-             (bar(frac, bar_w), "brightgreen"), (" ",), (total, "grey")],
-            flags,
-            [],
-            [("vol %s %d%%" % (bar(state.volume / 100.0, 10, "▪", "·", "▪"),
-                               state.volume), "grey")],
-        ]
+        return self.frame(TRACKS, width, height, title, body,
+                          footer=self.list_footer(lane, view))
 
     def panel_glyphs(self, width, height):
         """Every glyph family on screen at once.
@@ -1071,14 +1331,15 @@ class App:
         return self.main_box(width, height, "Glyph test", body)
 
     def panel_art(self, width, height):
-        if self._glyph_sample:
-            return self.panel_glyphs(width, height)
         """A small cover on the left, the track details laid out beside it.
 
         Side by side rather than stacked because the main panel is far wider
         than it is tall, and a cover big enough to fill that width vertically
         would be exactly the oversized-block problem the small size avoids.
+        Underneath, when the song has a timed lyric, the line being sung.
         """
+        if self._glyph_sample:
+            return self.panel_glyphs(width, height)
         inner = width - 2
         track = self.state.track
         title = VIEW_TITLE[V_ART]
@@ -1087,41 +1348,76 @@ class App:
                                  [[("  nothing playing", "grey")]])
 
         rows = art_rows_for(height, inner)
-        if not rows:
-            # Too cramped for a cover; the details alone are still worth showing.
-            body = [[]] + [[("  ",)] + line
-                           for line in self.art_details(max(8, inner - 2))]
-            return self.main_box(width, height, title, body)
-
-        cover = self._art.get((track.pid, rows, art.glyph_mode()))
-        if cover is None:
-            self.want_art(rows)
+        cover = None
+        if rows:
+            cover = self._art.get((track.pid, rows, art.glyph_mode()))
+            if cover is None:
+                self.want_art(rows)
         cover_w = rows * 2
-        details = self.art_details(inner - 2 - cover_w - ART_GUTTER)
+        text_x = 2 + cover_w + ART_GUTTER if rows else 2
+        details = self.now_playing(max(8, inner - text_x - 1))
 
         # While the cover is loading or missing, its square is held open so the
         # details do not jump sideways the moment it lands.
-        note = "" if cover else ("no art" if cover == [] else "…")
+        note = "" if cover else ("no art" if cover == [] else self.spinner())
 
         # The card is as tall as whichever of the two columns is taller, and is
         # centred in the panel rather than left hanging under the title.
         card = max(rows, len(details))
-        body = [[] for _ in range(max(1, (height - 2 - card) // 2))]
+        room = height - 2 - card
+        snippet = self.lyric_snippet(inner - 4) if room >= 5 else []
+        total = card + (len(snippet) + 1 if snippet else 0)
+        body = [[] for _ in range(max(0, (height - 2 - total) // 2))]
         for i in range(card):
             line = [("  ",)]
-            if i >= rows:
-                line.append((" " * cover_w,))
-            elif cover:
-                line.append((cover[i],))
-            elif i == rows // 2:
-                line.append((pad(note.center(cover_w), cover_w), "grey"))
-            else:
-                line.append((" " * cover_w,))
-            line.append((" " * ART_GUTTER,))
+            if i < rows:
+                if cover:
+                    line.append((cover[i],) if i < len(cover) else (" " * cover_w,))
+                elif i == rows // 2:
+                    line.append((pad(note.center(cover_w), cover_w), "grey"))
+            line.append((Tab(text_x),))
             if i < len(details):
                 line += details[i]
             body.append(line)
+        if snippet:
+            body.append([])
+            body += snippet
         return self.main_box(width, height, title, body)
+
+    def lyric_snippet(self, width):
+        """The line being sung, with the one before and the one after it."""
+        pid = self.state.track.pid
+        if lyrics.mode() == "off" or not pid:
+            return []
+        found = self._lyrics.get(pid)
+        if found is None:
+            self.want_lyrics()
+            return []
+        if not found.synced:
+            return []
+        current = found.line_at(self.position - self._lyric_delay)
+        out = []
+        for i, style in ((current - 1, ("grey",)), (current, (self.tone, "bold")),
+                         (current + 1, ("white",))):
+            text = found.lines[i][1] if 0 <= i < len(found.lines) else ""
+            if i == current and not text:
+                text = "♪"
+            text = truncate(clean(text), width)
+            out.append([(Tab(2 + max(0, (width - widest(text)) // 2)),),
+                        (text,) + style])
+        return out
+
+    def lyric_layout(self, found, width):
+        """The lyric wrapped to `width`: rows of (line index, text), and the
+        first row of each line. Cached, since it only changes with the song."""
+        key = (id(found), width)
+        if self._lyric_layout[0] != key:
+            rows, first = [], []
+            for i, (_at, text) in enumerate(found.lines):
+                first.append(len(rows))
+                rows += [(i, part) for part in (wrap(text, width) or [""])]
+            self._lyric_layout = (key, rows, first)
+        return self._lyric_layout[1], self._lyric_layout[2]
 
     def panel_lyrics(self, width, height):
         lane = self.lanes["lyrics"]
@@ -1138,49 +1434,81 @@ class App:
             lane.cursor = lane.scroll = 0
 
         title = VIEW_TITLE[V_LYRICS]
+        if pid:
+            title = "%s · %s" % (title, self.state.track.name)
         if not pid:
             return self.main_box(width, height, title,
                                  [[("  nothing playing", "grey")]])
         if found is None:
             self.want_lyrics()
             return self.main_box(width, height, title,
-                                 [[("  fetching lyrics…", "grey")]])
+                                 [[("  %s fetching lyrics…" % self.spinner(), "grey")]])
         if not found.lines:
             how = lyrics.mode()
             note = {"off": "lyrics are switched off (LAZYMUSIC_LYRICS)",
                     "tags": "no lyrics in this file's tags"}.get(
                         how, "no lyrics found for this track")
+            if found.instrumental:
+                note = "♪  instrumental  ♪"
             return self.main_box(width, height, title, [[("  " + note, "grey")]])
 
         # A timed transcript scrolls itself, up until the moment you scroll it
-        # by hand; `after_move` drops the follow and the next track restores it.
-        current = found.line_at(self.position) if found.synced else -1
-        if found.synced and self._follow and current >= 0 and current != lane.cursor:
+        # by hand; `after_move` drops the follow, and `enter` or the next track
+        # restores it.
+        inner = width - 2
+        avail = max(4, inner - 4)
+        current = found.line_at(self.position - self._lyric_delay) if found.synced else -1
+        if found.synced and self._follow and current >= 0:
             lane.goto(current, view)
-            lane.reposition("zz", view)
         lane.clamp(view)
 
-        inner = width - 2
+        # Long lines wrap rather than being cut off, so the view is laid out in
+        # wrapped rows and kept centred on the line that matters.
+        rows, first = self.lyric_layout(found, avail)
+        anchor = max(0, min(lane.cursor, len(first) - 1))
+        start = first[anchor]
+        span = (first[anchor + 1] if anchor + 1 < len(first) else len(rows)) - start
+        top = start + span // 2 - view // 2
+        if not (found.synced and self._follow):
+            top = max(0, min(top, len(rows) - view))
+        # While following, the line being sung holds the middle of the panel
+        # from the first line to the last, the way a karaoke screen does.
+
+        focused = self.focus == TRACKS
         body = []
-        for i in range(lane.scroll, min(len(lane.items), lane.scroll + view)):
-            text = lane.items[i][1]
+        for r in range(top, top + view):
+            if not 0 <= r < len(rows):
+                body.append([])
+                continue
+            i, text = rows[r]
+            if found.synced:
+                if i == current:
+                    style = (self.tone, "bold")
+                    text = text or "♪ ♪ ♪"
+                elif current >= 0 and i < current:
+                    style = ("grey",)
+                else:
+                    style = ("white",)
+                if i == lane.cursor and not self._follow and focused and i != current:
+                    style = ("brightcyan", "bold")
+            elif i == lane.cursor and focused:
+                style = ("brightcyan", "bold")
+            else:
+                style = ("white",)
             if not text:
                 body.append([])
-            elif i == current:
-                body.append([(pad("  " + truncate(text, inner - 2), inner),
-                              "brightgreen", "bold")])
-            elif i == lane.cursor and self.focus == TRACKS and not found.synced:
-                body.append([(pad("  " + truncate(text, inner - 2), inner),
-                              "brightcyan", "bold")])
-            else:
-                body.append([("  ",), (truncate(text, inner - 2), "white")])
+                continue
+            body.append([(Tab(2 + max(0, (avail - widest(text)) // 2)),),
+                         (text,) + style])
 
         if found.synced:
             title += "  ●" if self._follow else "  ○"
-        footer = found.source
+        parts = [found.source + (" · synced" if found.synced else "")]
+        if self._lyric_delay:
+            parts.append("%+.1fs" % self._lyric_delay)
         if len(lane.items) > view:
-            footer = "%s  %d/%d" % (found.source, lane.cursor + 1, len(lane.items))
-        return self.main_box(width, height, title, body, footer=footer)
+            parts.append("%d/%d" % (lane.cursor + 1, len(lane.items)))
+        return self.main_box(width, height, title, body, footer="  ".join(parts))
 
     def panel_queue(self, width, height):
         lane = self.lanes["queue"]
@@ -1188,32 +1516,14 @@ class App:
         self._views["queue"] = view
         lane.clamp(view)
         inner = width - 2
-        body = []
         if not lane.items:
             note = ("nothing playing from a playlist" if not self.state.playlist
                     else "nothing left in this playlist")
-            body.append([("  " + note, "grey")])
-            body.append([])
-            body.append([("  press ", "grey"), ("A", "bold"),
-                         (" on any track to queue it", "grey")])
+            body = [[("  " + note, "grey")], [],
+                    [("  press ", "grey"), ("A", "bold"),
+                     (" on any track to queue it", "grey")]]
         else:
-            index_w = len(str(len(lane.items)))
-            right_w = min(max(12, inner // 3), max(0, inner - index_w - 12))
-            left_w = max(6, inner - right_w - index_w - 4)
-            for i in range(lane.scroll, min(len(lane.items), lane.scroll + view)):
-                track = lane.items[i]
-                selected = i == lane.cursor
-                num = str(i + 1).rjust(index_w)
-                mark = "▸" if selected else " "
-                name = pad(truncate(track.name, left_w), left_w)
-                artist = truncate(track.artist, right_w)
-                if selected:
-                    style = ("brightcyan", "bold") if self.focus == TRACKS else ("cyan",)
-                    body.append([(pad("%s %s %s %s" % (mark, num, name, artist),
-                                      inner),) + style])
-                else:
-                    body.append([("%s %s " % (mark, num), "grey"), (name,),
-                                 (" ",), (artist, "grey")])
+            body = self.track_rows(lane, inner, view, self.focus == TRACKS)
         if self._queue_kind == "queue":
             title = "%s — queue (%d)" % (VIEW_TITLE[V_QUEUE], len(lane.all_items))
         elif self._queue_kind == "playlist":
@@ -1224,10 +1534,8 @@ class App:
                 title += "  ~shuffled"   # the real order is Music's to know
         else:
             title = VIEW_TITLE[V_QUEUE]
-        footer = ""
-        if len(lane.items) > view:
-            footer = "%d/%d" % (lane.cursor + 1, len(lane.items))
-        return self.main_box(width, height, title, body, footer=footer)
+        return self.main_box(width, height, title, body,
+                             footer=self.list_footer(lane, view))
 
     def help_rows(self, width):
         """Compose the whole key sheet for this width, however tall it comes out.
@@ -1289,7 +1597,8 @@ class App:
         footer = ""
         if total > view:
             footer = "j/k  %d-%d of %d" % (top + 1, min(top + view, total), total)
-        return box(width, height, "Keys", body, focused=False, footer=footer)
+        return self.frame(TRACKS, width, height, "Keys", body, footer=footer,
+                          focused=False)
 
     def key_bar(self, cols):
         # The bottom line doubles as vim's command line: `/` and `:` prompts are
@@ -1304,29 +1613,44 @@ class App:
                 segs.append(("   " + "  ".join(self._completions), "grey"))
             return row(segs, cols)
         if self.message and time.monotonic() < self.message_until:
-            return row([(" " + self.message, "yellow")], cols)
+            icon, tone = {"error": ("✗", "brightred"),
+                          "ok": ("✓", "brightgreen")}.get(
+                              self.message_kind, ("•", "yellow"))
+            return row([(" ",), (icon + " ", tone, "bold"), (self.message, tone)],
+                       cols)
 
         if self.view == V_HELP:
-            pairs = [("?/esc", "close help")]
+            pairs = [("?/esc", "close help"), ("j/k", "scroll")]
+        elif self.view == V_LYRICS:
+            pairs = [("space", "play/pause"), ("j/k", "scroll"),
+                     ("enter", "sing from here"), ("a", "art"), ("u", "up next"),
+                     ("esc", "tracks"), ("?", "help"), ("q", "quit")]
         elif self.view != V_TRACKS:
             pairs = [("space", "play/pause"), ("j/k", "move"), ("a", "art"),
                      ("y", "lyrics"), ("u", "up next"), ("esc", "tracks"),
                      ("?", "help"), ("q", "quit")]
         else:
             pairs = [("space", "play/pause"), ("j/k", "move"), ("h/l", "panel"),
-                     ("enter", "play"), ("a", "art"), ("y", "lyrics"),
-                     ("?", "help"), ("q", "quit")]
+                     ("enter", "play"), ("A", "queue"), ("a", "art"),
+                     ("y", "lyrics"), ("?", "help"), ("q", "quit")]
         segs = [(" ",)]
         for key, what in pairs:
             segs.append((key, "brightcyan", "bold"))
             segs.append((" " + what + "   ", "grey"))
 
-        # Echo any half-finished vim input, as vim shows it in the corner.
+        # The right-hand corner: half-finished vim input, as vim shows it, and
+        # a spinner while something you are waiting on is still loading.
+        corner = []
         hint = self.count + self.pending.replace("ctrl-", "^")
         if hint:
-            left = row(segs, max(0, cols - len(hint) - 1))
-            return left + row([(hint, "yellow", "bold"), (" ",)], len(hint) + 1)
-        return row(segs, cols)
+            corner.append((hint + " ", "yellow", "bold"))
+        if self.bus.loading():
+            corner.append((self.spinner() + " ", "brightcyan"))
+        if not corner:
+            return row(segs, cols)
+        corner_w = sum(width_of(seg[0]) for seg in corner)
+        return row(segs, max(0, cols - corner_w)) + row(corner, corner_w)
+
     # ------------------------------------------------------------- keys ----
     #
     # A small vim state machine. Digits accumulate a count, `g` / `z` / `ctrl-w`
@@ -1500,6 +1824,9 @@ class App:
             self.pop_view()
         elif key == "R":
             self.reload()
+        elif key == "ctrl-l":
+            self._size = None           # vim's redraw: repaint every row
+            self._help_width = -1
         elif key == "A":
             self.enqueue_selection()
         elif key == "D":
@@ -1629,7 +1956,10 @@ class App:
         try:
             handler(self, rest)
         except MusicError as e:
-            self.notify(str(e))
+            self.fail(e)
+        except ValueError:
+            # `:vol loud` used to take the whole UI down with a traceback.
+            self.notify("could not read %r as a number" % rest, 3.0, "error")
 
     def cmd_quit(self, rest):
         self.running = False
@@ -1642,7 +1972,7 @@ class App:
 
         def done(hits, err):
             if err:
-                self.notify(str(err))
+                self.fail(err)
                 return
             self.message = ""
             self.push_view()
@@ -1662,7 +1992,7 @@ class App:
 
         def done(hits, err):
             if err:
-                self.notify(str(err))
+                self.fail(err)
             elif not hits:
                 self.notify("nothing in your library matches that")
             else:
@@ -1758,7 +2088,10 @@ class App:
         """`:upnext` shows the queue; `:upnext clear` empties it."""
         if rest.strip() == "clear":
             def done(_value, err):
-                self.notify(str(err) if err else "queue cleared")
+                if err:
+                    self.fail(err)
+                else:
+                    self.notify("queue cleared", kind="ok")
                 self.after_queue_change()
             self.bus.submit("qclear", music.queue_clear, done)
             self.view = V_QUEUE
@@ -1778,6 +2111,37 @@ class App:
     def cmd_tracks(self, rest):
         self.view = V_TRACKS
 
+    def cmd_sleep(self, rest):
+        """`:sleep 30` pauses in thirty minutes; `:sleep off` cancels it."""
+        arg = rest.strip().lower().rstrip("m")
+        if not arg:
+            left = self.sleep_left()
+            self.notify("sleep timer: %s" % (left + " left" if left else
+                                             "off  (:sleep <minutes>)"))
+            return
+        if arg in ("off", "0", "cancel"):
+            self._sleep_at = 0.0
+            self.notify("sleep timer off", kind="ok")
+            return
+        minutes = float(arg)
+        if minutes <= 0:
+            raise ValueError(arg)
+        self._sleep_at = time.monotonic() + minutes * 60
+        self.notify("pausing in %s ☾" % self.sleep_left(), kind="ok")
+
+    def cmd_offset(self, rest):
+        """`:offset +0.5` shows lyrics half a second later; bare resets it."""
+        arg = rest.strip().rstrip("s")
+        if not arg or arg == "0":
+            self._lyric_delay = 0.0
+        elif arg[0] in "+-":
+            # Positive means the words come later, which is what you want when
+            # the highlight runs ahead of the singer.
+            self._lyric_delay += float(arg)
+        else:
+            self._lyric_delay = float(arg)
+        self.notify("lyrics offset %+.1fs" % self._lyric_delay, kind="ok")
+
     COMMANDS = {
         "q": cmd_quit, "quit": cmd_quit, "qa": cmd_quit, "x": cmd_quit,
         "search": cmd_search, "s": cmd_search, "find": cmd_search,
@@ -1791,6 +2155,7 @@ class App:
         "art": cmd_art, "cover": cmd_art, "lyrics": cmd_lyrics,
         "upnext": cmd_upnext, "queue": cmd_upnext, "tracks": cmd_tracks,
         "enqueue": cmd_enqueue, "add": cmd_enqueue,
+        "sleep": cmd_sleep, "offset": cmd_offset,
     }
 
     # -- actions -------------------------------------------------------------
@@ -1835,10 +2200,12 @@ class App:
                 self.act(music.play_playlist, sel[0])
                 self.notify("playing %s" % sel[0])
             return
+        if self.focus == TRACKS and self.view == V_LYRICS:
+            self.sing_from_cursor()
+            return
         lane, _ = self.focused_lane()
         track = lane.selected if lane is not None else None
-        # The lyrics lane holds text, not tracks, and the cover has no lane;
-        # neither has anything for enter to play.
+        # The cover has no lane, and so nothing for enter to play.
         if not isinstance(track, music.Track):
             return
         # A track picked out of Up Next belongs to the playing playlist, so it
@@ -1854,6 +2221,20 @@ class App:
         else:
             self.act(music.play_track, track.pid)
         self.notify("playing %s" % track.label)
+
+    def sing_from_cursor(self):
+        """`enter` on a timed lyric line: jump the song to it and follow again."""
+        found = self._lyrics.get(self.state.track.pid)
+        lane = self.lanes["lyrics"]
+        at = found.time_of(lane.cursor) if found and found.synced else None
+        self._follow = True
+        if at is None:
+            return
+        self.act(music.seek, max(0.0, at + self._lyric_delay))
+        # Move the playhead here too, so the highlight does not jump back to
+        # the old line for the second it takes the new position to be read.
+        self.state.position = max(0.0, at + self._lyric_delay)
+        self._pos_at = time.monotonic()
 
 
 class WindowName:
@@ -1910,7 +2291,7 @@ def run_tui():
         return 0
 
     app = App()
-    sys.stdout.write(ALT_ON + CUR_HIDE)
+    sys.stdout.write(ALT_ON + CUR_HIDE + WRAP_OFF + CLR_ALL)
     sys.stdout.flush()
     try:
         with WindowName(), Keys() as keys:
@@ -1924,11 +2305,12 @@ def run_tui():
                 app.bus.drain()
                 app.tick_loads()
                 app.tick_queue()
+                app.tick_sleep()
                 app.refresh()
     except KeyboardInterrupt:
         pass
     finally:
         app.close()
-        sys.stdout.write(CUR_SHOW + ALT_OFF)
+        sys.stdout.write(WRAP_ON + CUR_SHOW + ALT_OFF)
         sys.stdout.flush()
     return 0
