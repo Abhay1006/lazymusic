@@ -2067,65 +2067,31 @@ class TestAccent(unittest.TestCase):
         self.assertEqual(app.tone, fmt.fg(10, 20, 30))
 
 
-class TestPlaylistContext(unittest.TestCase):
-    """Starting a track so that the rest of its playlist follows it.
-
-    Playing a bare track leaves Music with no current playlist, and with no
-    playlist there is nothing for next/previous, shuffle or the media keys to
-    move through - the whole point of the reveal-and-play dance.
-    """
+class TestPlayTrackInPlaylist(unittest.TestCase):
+    """Starting a track picked out of a playlist."""
 
     def setUp(self):
         self.script = ""
-        self.answer = "true"
         self._tell = music.tell
 
         def tell(body, timeout=25.0):
             self.script = body
-            return self.answer
+            return ""
         music.tell = tell
-        self.addCleanup(self.restore)
+        self.addCleanup(setattr, music, "tell", self._tell)
 
-    def restore(self):
-        music.tell = self._tell
-
-    def test_the_selection_is_made_in_the_window_and_played_bare(self):
+    def test_the_track_is_played_straight_away(self):
         music.play_track_in_playlist("P1", "Road Trip")
-        # The window is pointed at the playlist, the track is selected in it,
-        # and `play` is given nothing to play - so it plays the selection, in
-        # the playlist, rather than the track on its own.
-        self.assertIn('set view of front browser window to p', self.script)
-        self.assertIn("reveal t", self.script)
-        self.assertRegex(self.script, r"reveal t\s*\n\s*delay [\d.]+\s*\n\s*play\b")
+        self.assertIn('set p to playlist "Road Trip"', self.script)
+        self.assertIn('play (first track of p whose persistent ID is "P1")', self.script)
 
-    def test_it_stops_first(self):
-        # A bare `play` resumes whatever is current in preference to the
-        # selection, so anything still loaded would win and the reveal be lost.
+    def test_the_music_window_is_left_alone(self):
+        # Selecting the track in Music's window and playing the selection never
+        # selected anything, so the bare `play` started the playlist's newest
+        # song and the wanted one only arrived seconds later.
         music.play_track_in_playlist("P1", "Road Trip")
-        self.assertLess(self.script.index("stop"), self.script.index("reveal t"))
-
-    def test_it_waits_to_see_the_track_it_asked_for(self):
-        music.play_track_in_playlist("P1", "Road Trip")
-        self.assertIn('if (persistent ID of current track) is "P1"', self.script)
-
-    def test_a_track_that_would_not_go_in_still_plays(self):
-        # Music will not take a selection in the Library's own song list, and a
-        # song that plays alone beats a key that does nothing.
-        music.play_track_in_playlist("P1", "Road Trip")
-        self.assertIn("if not ok then play t", self.script)
-
-    def test_it_reports_whether_the_context_took(self):
-        self.answer = "true"
-        self.assertTrue(music.play_track_in_playlist("P1", "Road Trip"))
-        self.answer = "false"
-        self.assertFalse(music.play_track_in_playlist("P1", "Road Trip"))
-
-    def test_the_library_song_list_is_left_alone(self):
-        # `special kind` is `none` for an ordinary playlist and `Music` for the
-        # library, where revealing selects the right row and `play` starts
-        # somewhere else entirely.
-        music.play_track_in_playlist("P1", "Music")
-        self.assertIn('((special kind of p) as text) is "none"', self.script)
+        for gone in ("reveal", "browser window", "stop", "delay"):
+            self.assertNotIn(gone, self.script)
 
 
 class TestSkipKeys(unittest.TestCase):
@@ -2281,23 +2247,16 @@ class TestUpNextUnderShuffle(unittest.TestCase):
         self.assertNotIn("queue", sent)
 
 
-class TestPlayInFeedback(unittest.TestCase):
+class TestPlayIn(unittest.TestCase):
     def setUp(self):
         self.app = tui.App()
         self.addCleanup(self.app.close)
-        self.backs = []
-        self.app.bus.submit = lambda key, call, then=None: self.backs.append(then)
-        self.track = Track(pid="p1", name="Lone Song")
+        self.sent = []
+        self.app.bus.submit = lambda key, call, then=None: self.sent.append(key)
 
-    def test_nothing_is_said_when_the_playlist_took(self):
-        self.app.play_in(self.track, "Road Trip")
-        self.backs[0](True, None)
-        self.assertNotIn("on its own", self.app.message)
-
-    def test_a_track_left_on_its_own_says_so(self):
-        self.app.play_in(self.track, "Music")
-        self.backs[0](False, None)
-        self.assertIn("nothing follows it", self.app.message)
+    def test_it_is_one_ordinary_action(self):
+        self.app.play_in(Track(pid="p1", name="Song"), "Road Trip")
+        self.assertEqual(self.sent, ["act:play_track_in_playlist"])
 
 
 class TestNothingReachesMusic(unittest.TestCase):

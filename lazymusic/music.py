@@ -519,64 +519,32 @@ def playlist_tracks(name):
 # Telling Music to `play` a track object plays that track and nothing else: it
 # leaves the player with no running order, so there is nothing for `next track`,
 # `previous track`, shuffle or the keyboard's media keys to act on. They do not
-# fail, they just quietly do nothing, which is what made all four look broken.
-# `current playlist` is no help in spotting it either - it comes back missing
-# sometimes and names the library other times, while still refusing to move
-# within it - which is why `next_track` reports from the step instead.
+# fail, they just quietly do nothing. `current playlist` is no help in spotting
+# it - it goes on naming the playlist while refusing to move within it - which
+# is why `next_track` reports from the step instead.
 #
-# Music will only build a running order for itself, and the one way to ask it to
-# is to make the selection in its own window: point the window at the playlist,
-# `reveal` the track - which selects it - and then `play` with no argument at
-# all. That plays the selection *inside* the playlist, so the rest of the list
-# follows it and shuffle picks from it.
+# How the track is referred to makes no difference: `play track 5 of p` and
+# `play (first track of p whose persistent ID is ...)` both start the right song
+# with nothing behind it, and so does playing the playlist first and the track
+# straight after. Only `play p` itself builds a running order, and it starts
+# from the top of the playlist as Music's window sorts it, not from track 1.
 #
-# Three things this depends on, each learned the hard way:
-#   * `stop` first. A bare `play` resumes whatever is current in preference to
-#     the selection, so anything still loaded wins and the reveal is ignored.
-#   * a pause after `reveal`. The selection is made by the window, and asking it
-#     to play sooner than about half a second later plays nothing at all.
-#   * an ordinary playlist. In the Library's own Songs view the reveal selects
-#     the right row and `play` starts somewhere else entirely, so that case is
-#     left to the plain `play t` below - a lone track, but a track that plays.
-#
-# Nothing about this is checkable in advance, so the result is: the track that
-# came up is compared against the one asked for, and a miss falls back to
-# playing it on its own.
-_IN_PLAYLIST = """
-set p to playlist %(playlist)s
-set t to (first track of p whose persistent ID is %(pid)s)
-set ok to false
-if ((special kind of p) as text) is "none" then
-    try
-        stop
-        set view of front browser window to p
-        reveal t
-        delay 0.8
-        play
-        repeat 8 times
-            delay 0.25
-            try
-                if (persistent ID of current track) is %(pid)s then
-                    set ok to true
-                    exit repeat
-                end if
-            end try
-        end repeat
-    end try
-end if
-if not ok then play t
-return ok as text
-"""
+# Selecting the track in Music's window and sending a bare `play` was tried, and
+# must not come back: `reveal` selects nothing for a streamed library, whether
+# Music is in front or not, so the bare `play` started the playlist's top row -
+# the newest song, in a playlist sorted by date added - and the wanted track
+# only replaced it seconds later, when the check for it gave up.
 
 
 def play_track_in_playlist(pid, playlist):
-    """Play a track in its playlist's context, so what follows is the rest of it.
+    """Play a track picked out of `playlist`, straight away.
 
-    Returns True when the playlist context took, False when the track had to be
-    played on its own - in which case nothing follows it.
+    It plays on its own, with nothing following it: see above for why no way of
+    starting one track keeps the rest of the playlist behind it.
     """
-    got = tell(_IN_PLAYLIST % {"playlist": lit(playlist), "pid": lit(pid)})
-    return got.strip() == "true"
+    tell("set p to playlist %s\n"
+         "play (first track of p whose persistent ID is %s)"
+         % (lit(playlist), lit(pid)))
 
 
 # ------------------------------------------------------------------- queue ----

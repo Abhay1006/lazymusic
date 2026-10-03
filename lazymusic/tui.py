@@ -1963,9 +1963,9 @@ class App:
     # `current playlist` cannot be trusted to say so either: after a bare play
     # it still names the library while refusing to move within it. So the step
     # itself reports whether anything moved, and a step that went nowhere says
-    # why rather than looking like a broken key. Playing from a playlist is what
-    # puts an order back; see `music.play_track_in_playlist`.
-    NO_ORDER = "%s is playing on its own - play from a playlist to skip through one"
+    # why rather than looking like a broken key. Only starting the playlist
+    # itself gives Music an order; see `music.play_track_in_playlist`.
+    NO_ORDER = "%s is playing on its own - start the playlist itself to skip through it"
 
     def skip_forward(self):
         self.skip(music.next_track)
@@ -2462,22 +2462,8 @@ class App:
         self._pos_at = time.monotonic()
 
     def play_in(self, track, playlist):
-        """Start a track inside a playlist, and say so if it would not go in.
-
-        The context is what makes the rest of the playlist follow, and what
-        `n`, `p` and the media keys have to move through - so on the rare
-        occasions Music will not take it (the Library's own song list is one;
-        see `music.play_track_in_playlist`) the track still plays, but silently
-        being the last thing that will play is worth a word.
-        """
-        def done(in_context, err):
-            self._acted(in_context, err)
-            if not err and not in_context:
-                self.notify("playing %s on its own - nothing follows it"
-                            % track.name, seconds=4.0)
-        self.bus.submit("act:play_track_in_playlist",
-                        lambda: music.play_track_in_playlist(track.pid, playlist),
-                        done)
+        """Start a track picked out of a playlist; it plays on its own."""
+        self.act(music.play_track_in_playlist, track.pid, playlist)
 
 
 class WindowName:

@@ -112,9 +112,10 @@ way `?` always has. The left stack keeps playing, searching and browsing while
 they are open.
 
 Highlighting a playlist loads it into the main panel; `enter` there plays the
-playlist from the start, or focus the main panel and pick a single track. Either
-way the playlist keeps playing after it: what follows is the rest of that
-playlist, in order, or at random with shuffle on.
+playlist from the start, and the rest of it follows, in order or at random with
+shuffle on. Focus the main panel and `enter` plays a single track - straight
+away, but on its own: Music offers no way to start one track and keep the rest
+of its playlist behind it (see *How it works*).
 
 `/` forgives: it ignores case and accents and matches every word in any order,
 so `beyonce` finds Beyoncé and `satie gymno` finds Gymnopédie No. 1.
@@ -407,28 +408,22 @@ shuffle and the keyboard's own media keys all quietly do nothing. They do not
 fail — there is simply nowhere to go — which is indistinguishable from four
 broken keys.
 
-Music will only build a running order for itself, and the one way to ask it to
-is to make the selection in its own window: point the window at the playlist,
-`reveal` the track — which selects it — and then `play` with *no argument*, so
-it plays the selection inside the playlist. The rest of the list follows, and
-shuffle picks from it. Three things this depends on, each learned the hard way:
+How the track is referred to makes no difference - by its position in the
+playlist or by its persistent ID, and even straight after starting the playlist
+itself - it still plays with nothing behind it. Only `play` given the playlist
+builds a running order, and it starts from the top of the playlist as Music's
+window sorts it, not from track 1. So a track picked from the list plays on its
+own, and `n` / `p` say so rather than looking broken.
 
-* **`stop` first.** A bare `play` resumes whatever is current in preference to
-  the selection, so anything still loaded wins and the reveal is ignored.
-* **A pause after `reveal`.** The selection is made by the window; asking it to
-  play sooner than about half a second later plays nothing at all.
-* **An ordinary playlist.** In the Library's own song list the reveal selects
-  the right row and `play` starts somewhere else entirely, so that case falls
-  back to a plain `play` — one track, on its own.
-
-None of this is checkable in advance, so the track that came up is compared
-against the one asked for and a miss falls back to playing it alone. When it
-does, the panel says the song is playing on its own rather than leaving you to
-discover it when nothing follows.
+Selecting the track in Music's own window and sending a bare `play` was tried
+and dropped: `reveal` selects nothing for a streamed library, whether Music is
+in front or not, so the bare `play` started the playlist's top row - the newest
+song, in a playlist sorted by date added - and the wanted track only replaced it
+seconds later, once the check for it gave up.
 
 `current playlist` cannot be used to tell whether there is a running order,
-either: after a bare `play` it still names the library while refusing to move
-within it. So `n` and `p` report from the step itself — the track is noted, the
+either: after playing a lone track it goes on naming the playlist while refusing
+to move within it. So `n` and `p` report from the step itself — the track is noted, the
 step is taken, and if nothing moved within a second the key says why instead of
 looking broken.
 
