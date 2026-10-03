@@ -22,6 +22,11 @@ _CODES = {
     "brightwhite": "97",
 }
 
+# Role name -> SGR parameters, filled in by `theme.apply`. Roles are what the
+# interface asks for ("muted", "focus", ...); the theme decides what they look
+# like. An empty value is a role that adds nothing in the current theme.
+_ROLES = {}
+
 # Rounded box drawing, as lazygit draws them.
 TL, TR, BL, BR, H, V = "╭", "╮", "╰", "╯", "─", "│"
 
@@ -91,16 +96,28 @@ def ech(count):
 def c(text, *styles):
     if not _ENABLED or not styles or not text:
         return text
-    # Names come from the table; anything that is already SGR parameters (what
-    # `fg` and `bg` produce) is passed straight through.
-    seq = ";".join(_CODES.get(s, s) for s in styles
-                   if s in _CODES or _SGR.match(s))
+    # A style is a theme role, a name from the table, or SGR parameters already
+    # (what `fg` and `bg` produce), which are passed straight through.
+    parts = []
+    for s in styles:
+        code = _ROLES.get(s)
+        if code is None:
+            code = _CODES.get(s) or (s if _SGR.match(s) else "")
+        if code:
+            parts.append(code)
+    seq = ";".join(parts)
     return "\033[%sm%s\033[0m" % (seq, text) if seq else text
 
 
 def strip_ansi(text):
     """Text with its colour escapes removed, so it can be measured or compared."""
     return _ESCAPE.sub("", text)
+
+
+def set_roles(roles):
+    """Replace the role table wholesale; see `theme.apply`."""
+    global _ROLES
+    _ROLES = dict(roles)
 
 
 def set_color(enabled):
@@ -311,8 +328,8 @@ def box(width, height, title, body, focused=False, footer="", x=None,
         rows = [blank if x is None else cha(x + 1) + blank] * max(0, height)
         return rows
     if edge is None:
-        edge = ("brightcyan", "bold") if focused else ("grey",)
-    label = ("brightcyan", "bold") if focused else ("white",)
+        edge = ("focus", "bold") if focused else ("border",)
+    label = ("focus", "bold") if focused else ("text",)
     inner = width - 2
 
     title = truncate(clean(title), max(0, inner - 4))

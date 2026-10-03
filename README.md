@@ -139,6 +139,8 @@ so `beyonce` finds Beyoncé and `satie gymno` finds Gymnopédie No. 1.
 | `:upnext play` · `:upnext clear` | start the queue now; empty it (`:add` queues the selection) |
 | `:sleep 30` · `:sleep off` | pause in 30 minutes; cancel (bare `:sleep` shows what is left) |
 | `:offset +0.5` · `:offset` | lyrics half a second later, for a transcript that runs early; reset |
+| `:theme nord` · `:theme` | recolour everything; bare `:theme` lists the themes |
+| `:accent theme` · `:accent cover` | keep the theme's accent, or tint it from the cover |
 | `:reload` | re-read the library (same as `R`) |
 | `:help` | the key list |
 
@@ -152,6 +154,33 @@ to move across. That frees `f` for favourite and `s` / `r` for shuffle / repeat.
 does and what is actually useful in a 1,200-track library; `n` / `p` therefore
 keep their media meaning of next / previous track. `ctrl-i` (jumplist forward)
 is unavailable because terminals send it as the same byte as `tab`.
+
+### Themes
+
+Every colour in lazymusic comes from a theme, so a theme recolours the panels,
+the key bar and the one-shot commands' output all at once:
+
+| Theme | Look |
+| --- | --- |
+| `classic` | the default: the terminal's own sixteen colours, so it follows your terminal's palette |
+| `catppuccin` | Catppuccin Mocha |
+| `gruvbox` | Gruvbox dark |
+| `nord` | Nord |
+| `mono` | no colour at all: bold, dim, underline and reverse video |
+
+`LAZYMUSIC_THEME=nord` picks one for good; `:theme nord` switches while the UI
+is up, for that session. An unknown name falls back to `classic` and says so,
+rather than refusing to start.
+
+By default the accent - the progress bar, the playing track, the lyric being
+sung - is lifted from the playing song's cover, so the interface takes on each
+song's colours. `LAZYMUSIC_ACCENT=theme` (or `:accent theme`) keeps the
+theme's own accent instead. `mono` keeps its own unless you ask for the cover
+with `LAZYMUSIC_ACCENT=cover`.
+
+The themes other than `classic` and `mono` use 24-bit colour, as the cover art
+already does. Adding one is a dict in `lazymusic/theme.py`, giving each of the
+roles listed in `ROLES` a `#rrggbb` colour.
 
 ### One-shot commands
 

@@ -3,7 +3,7 @@
 import json
 import sys
 
-from . import music
+from . import music, theme
 from .fmt import c, mmss, truncate
 from .osa import MusicError
 
@@ -48,15 +48,15 @@ def print_status(state, as_json=False):
         sys.stdout.write("\n")
         return
     if not state.running:
-        print(c("Music is not running.", "grey"))
+        print(c("Music is not running.", "muted"))
         return
     if state.stopped:
-        print(c("■ nothing playing", "grey"))
+        print(c("■ nothing playing", "muted"))
         return
     t = state.track
-    print("%s  %s" % (c(_icon(state), "green"), c(t.name, "bold")))
+    print("%s  %s" % (c(_icon(state), "accent"), c(t.name, "bold")))
     if t.artist:
-        print("   %s%s" % (t.artist, c("  ·  " + t.album, "grey") if t.album else ""))
+        print("   %s%s" % (t.artist, c("  ·  " + t.album, "muted") if t.album else ""))
     meta = "%s / %s" % (mmss(state.position), mmss(t.duration))
     flags = []
     if state.shuffle:
@@ -66,19 +66,19 @@ def print_status(state, as_json=False):
     if t.loved:
         flags.append("♥")
     flags.append("vol %d" % state.volume)
-    print(c("   %s  ·  %s" % (meta, "  ·  ".join(flags)), "grey"))
+    print(c("   %s  ·  %s" % (meta, "  ·  ".join(flags)), "muted"))
 
 
 def print_tracks(tracks):
     if not tracks:
-        print(c("No matches in your library.", "grey"))
+        print(c("No matches in your library.", "muted"))
         return
     width = max(20, min(46, max((len(t.name) for t in tracks), default=20)))
     for i, t in enumerate(tracks, 1):
         line = "%s  %s  %s" % (
-            c("%2d" % i, "grey"),
+            c("%2d" % i, "muted"),
             truncate(t.name, width).ljust(width),
-            c(truncate(t.artist, 30), "grey"),
+            c(truncate(t.artist, 30), "muted"),
         )
         print(line.rstrip())
 
@@ -101,14 +101,14 @@ def _resolve_and_play(query):
     _ensure_running()
     hits = music.search(query, limit=25)
     if not hits:
-        print(c("Nothing in your library matches %r." % query, "yellow"))
-        print(c("Add it to your library in Music, then try again.", "grey"))
+        print(c("Nothing in your library matches %r." % query, "note"))
+        print(c("Add it to your library in Music, then try again.", "muted"))
         return 1
     music.play_track(hits[0].pid)
-    print("%s  %s %s" % (c("▶", "green"), hits[0].name, c(hits[0].artist, "grey")))
+    print("%s  %s %s" % (c("▶", "accent"), hits[0].name, c(hits[0].artist, "muted")))
     if len(hits) > 1:
         print(c("   (%d other matches - run `mus search %s` to see them)"
-                % (len(hits) - 1, query), "grey"))
+                % (len(hits) - 1, query), "muted"))
     return 0
 
 
@@ -178,7 +178,7 @@ def dispatch(argv):
             music.toggle_loved()
     elif cmd in ("search", "s", "find"):
         if not args:
-            print(c("usage: lazymusic search <query>", "yellow"))
+            print(c("usage: lazymusic search <query>", "note"))
             return 2
         print_tracks(music.search(" ".join(args)))
         return 0
@@ -187,11 +187,11 @@ def dispatch(argv):
             print_tracks(music.playlist_tracks(" ".join(args)))
         else:
             for name, count in music.playlists():
-                print("%s  %s" % (truncate(name, 34).ljust(34), c("%d" % count, "grey")))
+                print("%s  %s" % (truncate(name, 34).ljust(34), c("%d" % count, "muted")))
         return 0
     elif cmd in ("pl", "playlist"):
         if not args:
-            print(c("usage: lazymusic pl <playlist name>", "yellow"))
+            print(c("usage: lazymusic pl <playlist name>", "note"))
             return 2
         _ensure_running()
         music.play_playlist(" ".join(args))
@@ -205,13 +205,16 @@ def dispatch(argv):
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    problem = theme.from_env()
+    if problem:
+        print(c(problem, "note"), file=sys.stderr)
     try:
         return dispatch(argv)
     except MusicError as e:
-        print(c("error: %s" % e, "red"), file=sys.stderr)
+        print(c("error: %s" % e, "error"), file=sys.stderr)
         return 1
     except (ValueError, IndexError):
-        print(c("Could not parse those arguments. Try `mus help`.", "yellow"),
+        print(c("Could not parse those arguments. Try `mus help`.", "note"),
               file=sys.stderr)
         return 2
     except KeyboardInterrupt:

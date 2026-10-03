@@ -7,7 +7,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from lazymusic import art, fmt, lyrics, osa  # noqa: E402
+from lazymusic import art, fmt, lyrics, osa, theme  # noqa: E402
 from lazymusic.cli import _relative  # noqa: E402
 from lazymusic import music  # noqa: E402
 from lazymusic.music import REPEAT_MODES, State, Track, _num  # noqa: E402
@@ -2061,7 +2061,7 @@ class TestAccent(unittest.TestCase):
     def test_the_interface_falls_back_without_one(self):
         app = tui.App()
         self.addCleanup(app.close)
-        self.assertEqual(app.tone, "brightgreen")
+        self.assertEqual(app.tone, "accent")
         app.state.track = Track(pid="p", name="x")
         app._accent["p"] = (10, 20, 30)
         self.assertEqual(app.tone, fmt.fg(10, 20, 30))
@@ -2322,6 +2322,137 @@ class TestNothingReachesMusic(unittest.TestCase):
             time.sleep(0.01)
             app.bus.drain()
         self.assertFalse(app.bus.busy, "worker jobs never came back")
+
+
+class TestThemes(unittest.TestCase):
+    """Every colour comes from the theme, so a theme recolours everything."""
+
+    def setUp(self):
+        self.was_color = fmt.color_enabled()
+        fmt.set_color(True)
+        self.addCleanup(fmt.set_color, self.was_color)
+        self.addCleanup(theme.apply, theme.DEFAULT)
+        self.addCleanup(theme.set_cover_accent, None)
+        for var in ("LAZYMUSIC_THEME", "LAZYMUSIC_ACCENT"):
+            self.addCleanup(self.restore_env, var, os.environ.get(var))
+
+    @staticmethod
+    def restore_env(var, value):
+        if value is None:
+            os.environ.pop(var, None)
+        else:
+            os.environ[var] = value
+
+    def test_every_theme_fills_every_role(self):
+        for name, spec in theme.THEMES.items():
+            self.assertEqual(set(spec), set(theme.ROLES), name)
+
+    def test_colours_are_well_formed(self):
+        for name, spec in theme.THEMES.items():
+            for role, value in spec.items():
+                if value.startswith("#"):
+                    self.assertRegex(value, r"^#[0-9a-f]{6}$", (name, role))
+                else:
+                    self.assertRegex(value, r"^[0-9;]*$", (name, role))
+
+    def test_classic_is_the_original_sixteen_colour_look(self):
+        theme.apply("classic")
+        self.assertEqual(fmt.c("x", "muted"), "\033[90mx\033[0m")
+        self.assertEqual(fmt.c("x", "focus", "bold"), "\033[96;1mx\033[0m")
+
+    def test_hex_colours_become_24_bit_and_selection_is_a_background(self):
+        theme.apply("nord")
+        self.assertEqual(fmt.c("x", "focus"), "\033[38;2;136;192;208mx\033[0m")
+        self.assertIn("48;2;59;66;82", fmt.c("x", "selection"))
+
+    def test_a_role_with_nothing_to_add_leaves_the_text_plain(self):
+        theme.apply("mono")
+        self.assertEqual(fmt.c("x", "text"), "x")
+
+    def test_plain_colour_names_still_work(self):
+        theme.apply("gruvbox")
+        self.assertEqual(fmt.c("x", "red"), "\033[31mx\033[0m")
+
+    def test_an_unknown_theme_is_refused_and_changes_nothing(self):
+        theme.apply("nord")
+        with self.assertRaises(KeyError):
+            theme.apply("solarised")
+        self.assertEqual(theme.current(), "nord")
+
+    def test_the_environment_picks_the_theme(self):
+        os.environ["LAZYMUSIC_THEME"] = "Catppuccin"
+        self.assertEqual(theme.from_env(), "")
+        self.assertEqual(theme.current(), "catppuccin")
+
+    def test_a_typo_in_the_environment_falls_back_rather_than_failing(self):
+        os.environ["LAZYMUSIC_THEME"] = "nrod"
+        problem = theme.from_env()
+        self.assertEqual(theme.current(), theme.DEFAULT)
+        self.assertIn("nrod", problem)
+
+    def test_the_cover_accent_can_be_switched_off(self):
+        os.environ["LAZYMUSIC_ACCENT"] = "theme"
+        theme.from_env()
+        self.assertFalse(theme.cover_accent())
+
+    def test_mono_keeps_its_own_accent_unless_asked(self):
+        theme.apply("mono")
+        self.assertFalse(theme.cover_accent())
+        theme.set_cover_accent(True)
+        self.assertTrue(theme.cover_accent())
+
+    def test_no_colour_is_named_outside_the_theme(self):
+        # A colour written straight into a row is one the theme cannot change.
+        named = re.compile(r'"(grey|white|brightwhite|cyan|brightcyan|yellow|'
+                           r'red|brightred|green|brightgreen|blue|magenta)"')
+        root = os.path.join(os.path.dirname(__file__), "..", "lazymusic")
+        for module in ("tui.py", "cli.py"):
+            with open(os.path.join(root, module), encoding="utf-8") as f:
+                self.assertEqual(named.findall(f.read()), [], module)
+
+
+class TestThemeCommands(unittest.TestCase):
+    """`:theme` and `:accent` while the interface is up."""
+
+    def setUp(self):
+        self.app = tui.App()
+        self.addCleanup(self.app.close)
+        self.app.bus.submit = lambda key, call, then=None: True
+        self.addCleanup(theme.apply, theme.DEFAULT)
+        self.addCleanup(theme.set_cover_accent, None)
+
+    def test_switching_theme_repaints_everything(self):
+        self.app._size = (100, 24)
+        self.app.run_command("theme gruvbox")
+        self.assertEqual(theme.current(), "gruvbox")
+        self.assertIsNone(self.app._size)
+        self.assertEqual(self.app.message_kind, "ok")
+
+    def test_bare_theme_lists_the_choices(self):
+        self.app.run_command("theme")
+        for name in theme.names():
+            self.assertIn(name, self.app.message)
+
+    def test_an_unknown_theme_says_so(self):
+        self.app.run_command("theme solarised")
+        self.assertEqual(theme.current(), theme.DEFAULT)
+        self.assertEqual(self.app.message_kind, "error")
+
+    def test_accent_theme_stops_the_cover_tinting_the_interface(self):
+        self.app.state.track = Track(pid="p", name="x")
+        self.app._accent["p"] = (10, 20, 30)
+        self.assertEqual(self.app.tone, fmt.fg(10, 20, 30))
+        self.app.run_command("accent theme")
+        self.assertEqual(self.app.tone, "accent")
+        self.app.run_command("accent cover")
+        self.assertEqual(self.app.tone, fmt.fg(10, 20, 30))
+
+    def test_every_theme_draws_a_frame(self):
+        self.app.state.running, self.app.state.player = True, "playing"
+        self.app.state.track = Track(pid="p", name="Song", artist="Band", duration=200.0)
+        for name in theme.names():
+            theme.apply(name)
+            self.assertEqual(len(self.app.compose(100, 24)), 24, name)
 
 
 if __name__ == "__main__":
