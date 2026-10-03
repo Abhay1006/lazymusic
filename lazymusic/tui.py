@@ -471,10 +471,12 @@ class App:
         self._help_width = -1     # width the key sheet was last composed for
         self._glyph_sample = False  # `:art test` shows the glyph families
         self._queue_items = []      # what is sitting in the queue playlist
+        self._played = []           # queued pids already heard, awaiting removal
         self._handoff_until = 0.0   # suppresses a second handoff on one change
         self._shuffle_restore = False  # shuffle we switched off for the queue
         self._restore_at = 0.0      # next attempt at putting shuffle back
         self._restore_tries = 0
+        self._flush_at = 0.0        # next attempt at deleting the heard tracks
         # sips needs somewhere to put the decoded cover, and the raw artwork has
         # to land on disk before it can be decoded at all. One directory for the
         # session, emptied on the way out.
@@ -561,10 +563,16 @@ class App:
             return
         before_pid = self.state.track.pid
         before_playlist = self.state.playlist
+        before_shuffle = self.state.shuffle
         self.state = state
         self._pos_at = time.monotonic()
         if state.track.pid != before_pid:
             self.on_track_change(before_pid, before_playlist)
+        elif state.shuffle != before_shuffle and self.view == V_QUEUE:
+            # Shuffle changes what can come next, so the panel showing what can
+            # come next is now out of date. Only worth the round trip while it
+            # is the thing being looked at.
+            self.want_queue()
 
     def on_track_change(self, before_pid="", before_playlist=""):
         """Whatever the main panel is showing now belongs to a different song.
@@ -574,24 +582,24 @@ class App:
         """
         self._follow = True
         self._lyric_delay = 0.0
-        # A queued track that has played has done its job. Dropping it here is
-        # what makes the queue drain as it goes rather than replaying from the
-        # top the next time it starts. Queued first, so the refresh below reads
-        # the list after the removal.
+        # Music.app was quit: the track went away rather than changed. Nothing
+        # was heard, and every refresh below goes through `tell`, which would
+        # start Music straight back up.
+        if not self.state.running:
+            return
+        # A queued track that has played has done its job, but it cannot be
+        # deleted yet: Music.app throws away the whole playback context - and
+        # the rest of the playlist with it - if the playlist it is playing is
+        # edited underneath it. So the pid is only noted here, and the playlist
+        # is tidied in `flush_played` once playback is somewhere else.
         if before_playlist == music.QUEUE and before_pid:
-            self.bus.submit("drain",
-                            lambda: music.queue_remove_pid(before_pid),
-                            self._drained)
+            self._played.append(before_pid)
         if self.view in (V_LYRICS, V_ART) and lyrics.mode() != "off":
             self.want_lyrics()
         if self.view == V_QUEUE:
             self.want_queue()
         else:
             self.refresh_queue_items()
-
-    def _drained(self, _value, err):
-        if err:
-            self.fail(err)
 
     @property
     def position(self):
@@ -777,6 +785,57 @@ class App:
 
         self.bus.submit("lyrics", lambda: lyrics.for_track(track), done)
 
+    def pending_with_positions(self):
+        """The queue minus what has been heard, each with its playlist position.
+
+        The played tracks are still physically in the playlist - see
+        `on_track_change` - so their positions have to be counted past to reach
+        a track's real one, which is what `dequeue` deletes by.
+        """
+        left = {}
+        for pid in self._played:
+            left[pid] = left.get(pid, 0) + 1
+        out = []
+        for position, track in enumerate(self._queue_items, 1):
+            if left.get(track.pid):
+                left[track.pid] -= 1        # an earlier copy of this already played
+            else:
+                out.append((position, track))
+        return out
+
+    @property
+    def pending_queue(self):
+        """What is still to play. Everything that asks "what is queued" wants this."""
+        if not self._played:
+            return list(self._queue_items)
+        return [track for _, track in self.pending_with_positions()]
+
+    def flush_played(self):
+        """Delete the already-heard tracks, now that the queue is not playing.
+
+        Safe only because the caller has checked playback has left the queue;
+        doing this a moment too early is what wiped the queue mid-run.
+        """
+        if not self._played or time.monotonic() < self._flush_at:
+            return
+        pids, self._played = self._played, []
+
+        def done(_value, err):
+            if err:
+                self.fail(err)
+                self._played = pids + self._played   # try again later
+                # This runs every tick, so a failure that persists would
+                # otherwise put the same error up five times a second.
+                self._flush_at = time.monotonic() + self.FLUSH_RETRY
+                return
+            self.refresh_queue_items()
+        if not self.bus.submit("drain", lambda: music.queue_remove_pids(pids), done):
+            # A drain is still out, and `submit` drops a duplicate key rather
+            # than queueing it - so these go back to wait for the next round.
+            self._played = pids + self._played
+
+    FLUSH_RETRY = 30.0          # seconds between attempts after a failed drain
+
     def want_queue(self):
         """Refill Up Next.
 
@@ -794,15 +853,25 @@ class App:
                 return ("none", [])
             return ("playlist", music.playlist_tracks(playlist))
 
+        def pending(tracks):
+            self._queue_items = list(tracks)
+            return self.pending_queue
+
         def done(value, err):
             if err:
                 self.fail(err)
                 return
             kind, tracks = value
+            if kind == "queue":
+                # Heard tracks linger in the playlist until `flush_played` can
+                # safely remove them; Up Next must not list them as still to come.
+                tracks = pending(tracks)
+                if not tracks:
+                    kind = "none"
             self._queue_kind = kind
             if kind == "playlist":
                 self._cache[playlist] = (time.monotonic(), tracks)
-                tracks = self.after_current(tracks)
+                tracks = self.up_next(tracks)
             lane = self.lanes["queue"]
             lane.set_items(tracks)
             lane.clamp(self._views.get("queue", 10))
@@ -841,18 +910,24 @@ class App:
         if now < self._handoff_until:
             return              # a handoff just fired; let the state catch up
         state = self.state
-        # Shuffle goes back once playback has left the queue for something
-        # else. Waiting for it to be *playing* is not fussiness: Music refuses
-        # property writes while it has no current playlist, and that is exactly
-        # where it lands when the queue runs out - so the write is held until
-        # there is something for it to apply to.
-        if (self._shuffle_restore and state.playing
-                and state.playlist != music.QUEUE):
+        # Everything below talks to Music, and `tell` launches it when it is
+        # down - so with Music quit, this would reopen it on the next tick.
+        if not state.running:
+            return
+        if state.playlist == music.QUEUE:
+            return              # the queue is running; leave it entirely alone
+        # Past here playback is not in the queue, so the playlist can be edited
+        # without Music.app dropping what it is doing.
+        self.flush_played()
+        # Shuffle goes back as soon as playback has left the queue - including
+        # when the queue simply ran out and stopped, which is the common way to
+        # finish and the case that used to leave shuffle switched off for good.
+        if self._shuffle_restore:
             self.restore_shuffle()
             return
-        if not self._queue_items:
+        if not self.pending_queue:
             return
-        if not state.playing or state.playlist == music.QUEUE:
+        if not state.playing:
             return
         duration = state.track.duration
         if not duration or duration - self.position > HANDOFF:
@@ -870,7 +945,8 @@ class App:
         entire point is its order - so shuffle steps aside while the queue runs
         and is put back when it is done.
         """
-        if not self._queue_items:
+        pending = self.pending_queue
+        if not pending:
             self.notify("nothing queued - press A on a track to queue it")
             return
         # Nothing else in here may act on the player state until the change has
@@ -880,8 +956,14 @@ class App:
         # turned off.
         self._handoff_until = time.monotonic() + 8.0
         stand_down = self.state.shuffle
+        played = self._played
+        self._played = []
 
         def job():
+            # The heard tracks go now, in the one window where it is safe: the
+            # queue is not playing yet, and clearing them first is what lets
+            # `play playlist` start from the top and still be the right track.
+            music.queue_remove_pids(played)
             if stand_down:
                 music.set_shuffle(False)
             music.play_queue()
@@ -892,14 +974,24 @@ class App:
             if music.status().player != "playing":
                 music.play()
 
-        if stand_down:
-            self._shuffle_restore = True
-            self._restore_tries = 0
-            self._restore_at = 0.0
-        self.notify("up next: %s" % self._queue_items[0].label)
-        self.bus.submit("startqueue", job, self._acted)
+        def done(value, err):
+            if err:
+                # Nothing started, so nothing is owed: putting shuffle back now
+                # would turn it on over a queue that never stood it down.
+                self._played = played + self._played
+                self._handoff_until = 0.0
+                self.fail(err)
+                return
+            if stand_down:
+                self._shuffle_restore = True
+                self._restore_tries = 0
+                self._restore_at = 0.0
+            self.refresh_queue_items()
+        self.notify("up next: %s" % pending[0].label)
+        self.bus.submit("startqueue", job, done)
 
     RESTORE_TRIES = 12          # about a minute of trying, then let it go
+    RESTORE_IDLE = 30.0         # seconds between attempts while nothing plays
 
     def sleep_left(self):
         """Time left on the sleep timer as `25m` or `40s`, or None if unset."""
@@ -919,20 +1011,27 @@ class App:
     def restore_shuffle(self):
         """Put shuffle back once the queue is no longer what is playing.
 
-        Music refuses property writes while it has no current playlist, which is
-        exactly the state it lands in when the queue runs out and playback
-        stops. So the flag is only cleared once the write is confirmed, and the
-        attempt is repeated at intervals until something is playing again. This
-        is housekeeping rather than anything asked for, so a failure is quiet.
+        The flag is only cleared once the write is confirmed, and the attempt is
+        repeated at intervals, because Music.app does drop property writes while
+        its playback engine is wedged. This is housekeeping rather than anything
+        asked for, so a failure is quiet.
+
+        Music may also refuse the write while it has no current playlist, which
+        is where it lands when the queue runs out. So attempts made with nothing
+        playing are spaced out and do not count towards giving up: a queue that
+        ended in silence still gets its shuffle back once something plays.
         """
         now = time.monotonic()
         if not self._shuffle_restore or now < self._restore_at:
             return
-        self._restore_at = now + 4.0
-        self._restore_tries += 1
-        if self._restore_tries > self.RESTORE_TRIES:
-            self._shuffle_restore = False       # give up rather than nag
-            return
+        if self.state.playing:
+            self._restore_at = now + 4.0
+            self._restore_tries += 1
+            if self._restore_tries > self.RESTORE_TRIES:
+                self._shuffle_restore = False   # give up rather than nag
+                return
+        else:
+            self._restore_at = now + self.RESTORE_IDLE
 
         def done(_value, err):
             if not err:
@@ -964,7 +1063,7 @@ class App:
                 self.want_queue()
             # With nothing playing there is no current track to wait for, so a
             # queued song starts now instead of sitting there until you notice.
-            if start_if_idle and self.state.stopped and self._queue_items:
+            if start_if_idle and self.state.stopped and self.pending_queue:
                 self.start_queue()
         self.bus.submit("queueitems", music.queue_tracks, then)
 
@@ -973,12 +1072,25 @@ class App:
         if self._queue_kind != "queue":
             self.notify("nothing queued - press A on a track to queue it")
             return
+        if self.state.playlist == music.QUEUE:
+            # Editing the playing playlist makes Music.app discard the rest of
+            # it, so removing a track here would take the whole queue with it.
+            self.notify("can't edit the queue while it is playing - press D after it moves on")
+            return
         lane = self.lanes["queue"]
         if not lane.items:
             return
         track = lane.selected
-        # The lane may be filtered, so its cursor is not the playlist position.
-        index = lane.all_items.index(track) + 1
+        # The lane may be filtered, and it lists only what is still to play,
+        # while the playlist still holds the tracks already heard - so the
+        # cursor is not the playlist position. Take it from the same mapping
+        # the lane was built from.
+        pending = self.pending_with_positions()
+        row = lane.all_items.index(track)
+        if row >= len(pending):
+            self.notify("that track is no longer in the queue")
+            return
+        index = pending[row][0]
 
         def done(_value, err):
             if err:
@@ -996,6 +1108,21 @@ class App:
             if track.pid == pid:
                 return tracks[i + 1:]
         return list(tracks)
+
+    def up_next(self, tracks):
+        """What can come next out of the playlist that is playing.
+
+        With shuffle off that is the tracks below the current one, in order.
+        With it on there is no order to show: Music picks from the whole
+        playlist and does not publish what it picked, so every track that is
+        not the one playing is offered instead of a slice that only looks
+        certain. Toggling shuffle visibly changes the list, which is the honest
+        answer to what shuffle has done.
+        """
+        if not self.state.shuffle:
+            return self.after_current(tracks)
+        pid = self.state.track.pid
+        return [track for track in tracks if track.pid != pid]
 
     # ------------------------------------------------------------- draw ----
 
@@ -1543,10 +1670,16 @@ class App:
 
     def panel_queue(self, width, height):
         lane = self.lanes["queue"]
-        view = max(1, height - 2)
+        inner = width - 2
+        # With shuffle on the list is everything the playlist could go to next
+        # rather than a running order (see `up_next`), and a line saying so is
+        # the difference between a panel that has changed and one that looks
+        # like shuffle did nothing. It costs a row, so the list gets one fewer.
+        shuffled = (self._queue_kind == "playlist" and self.state.shuffle
+                    and bool(lane.items))
+        view = max(1, height - 2 - (1 if shuffled else 0))
         self._views["queue"] = view
         lane.clamp(view)
-        inner = width - 2
         if not lane.items:
             note = ("nothing playing from a playlist" if not self.state.playlist
                     else "nothing left in this playlist")
@@ -1555,14 +1688,14 @@ class App:
                      (" on any track to queue it", "grey")]]
         else:
             body = self.track_rows(lane, inner, view, self.focus == TRACKS)
+            if shuffled:
+                body.insert(0, [("  shuffle is on - any of these could be next", "grey")])
         if self._queue_kind == "queue":
             title = "%s — queue (%d)" % (VIEW_TITLE[V_QUEUE], len(lane.all_items))
         elif self._queue_kind == "playlist":
-            # Shuffle makes the real order unknowable, so the title stops
-            # claiming to know it rather than showing a confidently wrong list.
             title = "%s — %s" % (VIEW_TITLE[V_QUEUE], self.state.playlist)
             if self.state.shuffle:
-                title += "  ~shuffled"   # the real order is Music's to know
+                title += "  (shuffled)"  # the real order is Music's to know
         else:
             title = VIEW_TITLE[V_QUEUE]
         return self.main_box(width, height, title, body,
@@ -1798,9 +1931,9 @@ class App:
         if key == " ":
             self.act(music.toggle)
         elif key in ("n", ">", "ctrl-n"):
-            self.act(music.next_track)
+            self.skip_forward()
         elif key in ("p", "<", "ctrl-p"):
-            self.act(music.prev_track)
+            self.skip_back()
         elif key in ("right", "]"):
             self.act(music.seek, 10 * n, True)
         elif key in ("left", "["):
@@ -1821,6 +1954,29 @@ class App:
         else:
             return False
         return True
+
+    # A track Music was told to play on its own has no running order behind it,
+    # and with nothing to move through `next track` does nothing at all - it
+    # does not refuse, it just sits there, and so do the keyboard's media keys.
+    # `current playlist` cannot be trusted to say so either: after a bare play
+    # it still names the library while refusing to move within it. So the step
+    # itself reports whether anything moved, and a step that went nowhere says
+    # why rather than looking like a broken key. Playing from a playlist is what
+    # puts an order back; see `music.play_track_in_playlist`.
+    NO_ORDER = "%s is playing on its own - play from a playlist to skip through one"
+
+    def skip_forward(self):
+        self.skip(music.next_track)
+
+    def skip_back(self):
+        self.skip(music.prev_track)
+
+    def skip(self, step):
+        def done(moved, err):
+            self._acted(moved, err)
+            if not err and not moved and self.state.track:
+                self.notify(self.NO_ORDER % self.state.track.name, seconds=4.0)
+        self.bus.submit("act:%s" % step.__name__, step, done)
 
     def mode_key(self, key):
         if key == "q":
@@ -2072,10 +2228,10 @@ class App:
         self.act(music.pause)
 
     def cmd_next(self, rest):
-        self.act(music.next_track)
+        self.skip_forward()
 
     def cmd_prev(self, rest):
-        self.act(music.prev_track)
+        self.skip_back()
 
     def cmd_filter(self, rest):
         lane, view = self.focused_lane()
@@ -2248,7 +2404,7 @@ class App:
         else:
             playlist = ""
         if playlist:
-            self.act(music.play_track_in_playlist, track.pid, playlist)
+            self.play_in(track, playlist)
         else:
             self.act(music.play_track, track.pid)
         self.notify("playing %s" % track.label)
@@ -2266,6 +2422,24 @@ class App:
         # the old line for the second it takes the new position to be read.
         self.state.position = max(0.0, at + self._lyric_delay)
         self._pos_at = time.monotonic()
+
+    def play_in(self, track, playlist):
+        """Start a track inside a playlist, and say so if it would not go in.
+
+        The context is what makes the rest of the playlist follow, and what
+        `n`, `p` and the media keys have to move through - so on the rare
+        occasions Music will not take it (the Library's own song list is one;
+        see `music.play_track_in_playlist`) the track still plays, but silently
+        being the last thing that will play is worth a word.
+        """
+        def done(in_context, err):
+            self._acted(in_context, err)
+            if not err and not in_context:
+                self.notify("playing %s on its own - nothing follows it"
+                            % track.name, seconds=4.0)
+        self.bus.submit("act:play_track_in_playlist",
+                        lambda: music.play_track_in_playlist(track.pid, playlist),
+                        done)
 
 
 class WindowName:

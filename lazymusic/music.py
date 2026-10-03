@@ -166,8 +166,34 @@ def stop():
     tell("stop")
 
 
+# Music answers `next track` with silence, not an error, when the current track
+# has no running order behind it - which is what a track played on its own has,
+# and what the media keys hit too. The only way to know is to look: the track is
+# noted, the step is taken, and the answer is whether anything moved. Polling
+# rather than one flat delay so the ordinary case comes back in a fifth of a
+# second and only the dead end waits the full second.
+_MOVED = """
+set was to ""
+try
+    set was to persistent ID of current track
+end try
+%s
+repeat 7 times
+    delay 0.15
+    try
+        if (persistent ID of current track) is not was then return "true"
+    end try
+end repeat
+return "false"
+"""
+
+
 def next_track():
-    tell("next track")
+    """Step forward. Returns False when there was nothing to step to."""
+    return tell(_MOVED % "next track").strip() == "true"
+
+
+REWIND_WITHIN = 3.0   # seconds into a track that `previous` still steps back
 
 
 def prev_track():
@@ -175,14 +201,17 @@ def prev_track():
 
     This mirrors what every music player does with a "previous" button: the
     first press rewinds, a second press within a few seconds goes back a track.
+    Returns False only when stepping back had nowhere to go; a rewind always
+    counts as having done something, since it plainly has.
     """
-    tell(
-        "if (player position) > 3 then\n"
-        "    set player position to 0\n"
-        "else\n"
-        "    previous track\n"
-        "end if"
-    )
+    rewound = tell("if (player position) > %f then\n"
+                   "    set player position to 0\n"
+                   "    return \"true\"\n"
+                   "end if\n"
+                   "return \"false\"" % REWIND_WITHIN).strip() == "true"
+    if rewound:
+        return True
+    return tell(_MOVED % "previous track").strip() == "true"
 
 
 def seek(seconds, relative=False):
@@ -487,13 +516,67 @@ def playlist_tracks(name):
     return _columns("(every track of playlist pl)", setup="set pl to %s" % lit(name))
 
 
+# Telling Music to `play` a track object plays that track and nothing else: it
+# leaves the player with no running order, so there is nothing for `next track`,
+# `previous track`, shuffle or the keyboard's media keys to act on. They do not
+# fail, they just quietly do nothing, which is what made all four look broken.
+# `current playlist` is no help in spotting it either - it comes back missing
+# sometimes and names the library other times, while still refusing to move
+# within it - which is why `next_track` reports from the step instead.
+#
+# Music will only build a running order for itself, and the one way to ask it to
+# is to make the selection in its own window: point the window at the playlist,
+# `reveal` the track - which selects it - and then `play` with no argument at
+# all. That plays the selection *inside* the playlist, so the rest of the list
+# follows it and shuffle picks from it.
+#
+# Three things this depends on, each learned the hard way:
+#   * `stop` first. A bare `play` resumes whatever is current in preference to
+#     the selection, so anything still loaded wins and the reveal is ignored.
+#   * a pause after `reveal`. The selection is made by the window, and asking it
+#     to play sooner than about half a second later plays nothing at all.
+#   * an ordinary playlist. In the Library's own Songs view the reveal selects
+#     the right row and `play` starts somewhere else entirely, so that case is
+#     left to the plain `play t` below - a lone track, but a track that plays.
+#
+# Nothing about this is checkable in advance, so the result is: the track that
+# came up is compared against the one asked for, and a miss falls back to
+# playing it on its own.
+_IN_PLAYLIST = """
+set p to playlist %(playlist)s
+set t to (first track of p whose persistent ID is %(pid)s)
+set ok to false
+if ((special kind of p) as text) is "none" then
+    try
+        stop
+        set view of front browser window to p
+        reveal t
+        delay 0.8
+        play
+        repeat 8 times
+            delay 0.25
+            try
+                if (persistent ID of current track) is %(pid)s then
+                    set ok to true
+                    exit repeat
+                end if
+            end try
+        end repeat
+    end try
+end if
+if not ok then play t
+return ok as text
+"""
+
+
 def play_track_in_playlist(pid, playlist):
-    """Play a track in its playlist's context, so what follows is the rest of it."""
-    tell(
-        "set p to playlist %s\n"
-        "set t to (first track of p whose persistent ID is %s)\n"
-        "play t" % (lit(playlist), lit(pid))
-    )
+    """Play a track in its playlist's context, so what follows is the rest of it.
+
+    Returns True when the playlist context took, False when the track had to be
+    played on its own - in which case nothing follows it.
+    """
+    got = tell(_IN_PLAYLIST % {"playlist": lit(playlist), "pid": lit(pid)})
+    return got.strip() == "true"
 
 
 # ------------------------------------------------------------------- queue ----
@@ -528,13 +611,28 @@ def queue_add(pid):
 
     Duplicating into a playlist keeps the track's persistent ID, so the playing
     marker and removal both still match it afterwards.
+
+    Tracks Apple has pulled from the catalogue are turned away rather than
+    queued. Nothing can play them - Music silently skips over them in a playlist
+    and refuses to start on them at all - so letting one into the queue only
+    produces a song that never comes and a gap nobody can explain.
     """
-    tell("set nm to %s\n"
-         "if not (exists user playlist nm) then\n"
-         "    make new user playlist with properties {name:nm}\n"
-         "end if\n"
-         "set t to (first track of library playlist 1 whose persistent ID is %s)\n"
-         "duplicate t to user playlist nm" % (lit(QUEUE), lit(pid)))
+    got = tell("set nm to %s\n"
+               "set t to (first track of library playlist 1 whose persistent ID is %s)\n"
+               # `st` on its own is a term in Music's dictionary and will not
+               # parse as a variable; `cstat` is nobody's keyword.
+               "set cstat to \"\"\n"
+               "try\n"
+               "    set cstat to (cloud status of t) as text\n"
+               "end try\n"
+               "if cstat is \"no longer available\" then return \"gone\"\n"
+               "if not (exists user playlist nm) then\n"
+               "    make new user playlist with properties {name:nm}\n"
+               "end if\n"
+               "duplicate t to user playlist nm\n"
+               "return \"ok\"" % (lit(QUEUE), lit(pid))).strip()
+    if got == "gone":
+        raise MusicError("Apple Music no longer has that track - it cannot be played")
 
 
 def queue_remove(index):
@@ -548,19 +646,41 @@ def queue_remove(index):
     tell("delete track %d of user playlist %s" % (int(index), lit(QUEUE)))
 
 
-def queue_remove_pid(pid):
-    """Drop the first queue entry with this persistent ID, if it is still there.
+def queue_remove_pids(pids):
+    """Drop one queue entry per entry in `pids`, earliest copy of each first.
 
-    Used to drain a track once it has finished playing, so the queue empties as
-    it goes instead of replaying from the top the next time it is started. A
-    miss is ignored: the entry may already have been removed by hand.
+    Used to clear out tracks that have already played, so the queue empties as
+    it goes instead of replaying from the top the next time it is started.
+
+    NEVER call this while Music is playing the queue playlist. Deleting the
+    track Music is playing makes it drop the playback context: `current
+    playlist` reverts to the library, so it carries on into that instead of
+    through the rest of the queue, and nothing drains again afterwards. The
+    caller waits until playback is somewhere else; see `App.flush_played`.
+
+    Positions are resolved here rather than with a `whose` clause because
+    `delete ... whose persistent ID is ...` fails with -1708 (the filtered
+    specifier has no delete handler), the same trap `queue_remove` documents.
+    Deletes go out highest position first so each one leaves the rest valid.
     """
-    tell("set nm to %s\n"
-         "if (exists user playlist nm) then\n"
-         "    try\n"
-         "        delete (first track of user playlist nm whose persistent ID is %s)\n"
-         "    end try\n"
-         "end if" % (lit(QUEUE), lit(pid)))
+    if not pids:
+        return
+    tracks = queue_tracks()
+    if not tracks:
+        return
+    remaining = {}
+    for pid in pids:
+        remaining[pid] = remaining.get(pid, 0) + 1
+    victims = []
+    for position, track in enumerate(tracks, 1):
+        if remaining.get(track.pid):
+            remaining[track.pid] -= 1
+            victims.append(position)
+    if not victims:
+        return
+    tell("set pl to user playlist %s\n%s"
+         % (lit(QUEUE),
+            "\n".join("delete track %d of pl" % i for i in sorted(victims, reverse=True))))
 
 
 def queue_clear():
@@ -575,13 +695,13 @@ def play_queue():
 
 
 __all__ = [
-    "MusicError", "REPEAT_MODES", "State", "Track", "cycle_repeat",
+    "MusicError", "REPEAT_MODES", "REWIND_WITHIN", "State", "Track", "cycle_repeat",
     "ensure_running", "is_running", "launch", "next_track", "nudge_volume", "pause", "play", "play_playlist",
     "play_track", "play_track_in_playlist", "playlist_tracks", "playlists",
     "prev_track", "search", "seek", "save_artwork", "current_lyrics",
     "track_lyrics", "MOVED",
     "QUEUE", "queue_add", "queue_clear", "queue_exists", "queue_remove",
-    "queue_tracks", "queue_remove_pid", "play_queue",
+    "queue_tracks", "queue_remove_pids", "play_queue",
     "set_loved", "set_repeat", "set_shuffle", "set_volume", "status", "stop",
     "toggle", "toggle_loved", "toggle_shuffle",
 ]

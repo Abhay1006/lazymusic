@@ -376,10 +376,6 @@ class TestLaneFilter(unittest.TestCase):
         lane.goto(1, 10)
         self.assertEqual(lane.selected, "three")
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestLrc(unittest.TestCase):
     def test_plain_lines_have_no_times(self):
         parsed = lyrics.parse_lrc("first line\n\nthird line")
@@ -741,10 +737,14 @@ class TestQueueEditing(unittest.TestCase):
         self.app.bus.submit = lambda key, call, then=None: self.sent.append(key)
         self.tracks = [Track(pid="p%d" % i, name="t%d" % i) for i in range(4)]
 
-    def queue_view(self, items):
+    def queue_view(self, items, played=()):
         self.app.view = tui.V_QUEUE
         self.app.focus = tui.TRACKS
         self.app._queue_kind = "queue"
+        # The lane shows what is still to play; the playlist behind it also
+        # still holds whatever has been heard, and `dequeue` maps between them.
+        self.app._queue_items = list(played) + list(items)
+        self.app._played = [t.pid for t in played]
         self.app.lanes["queue"].set_items(items)
 
     def test_A_queues_the_track_under_the_cursor(self):
@@ -793,11 +793,25 @@ class TestQueueEditing(unittest.TestCase):
         lane = self.app.lanes["queue"]
         lane.apply_filter("t2")
         self.assertEqual(lane.items, [self.tracks[2]])
-        captured = {}
-        self.app.bus.submit = lambda key, call, then=None: captured.update(
-            key=key, index=lane.all_items.index(lane.selected) + 1)
         self.app.dequeue()
-        self.assertEqual(captured["index"], 3)      # 1-based, unfiltered
+        self.assertEqual(self.sent, ["dequeue:3"])  # 1-based, unfiltered
+
+    def test_removal_counts_past_the_tracks_already_heard(self):
+        # Heard tracks stay in the playlist until it is safe to delete them, so
+        # a row's position is its lane index plus everything still sitting in
+        # front of it - deleting by the lane index would take the wrong track.
+        self.queue_view(self.tracks[2:], played=self.tracks[:2])
+        self.app.normal_key("D")
+        self.assertEqual(self.sent, ["dequeue:3"])
+
+    def test_D_will_not_edit_the_queue_while_it_is_playing(self):
+        # Deleting out of the playlist Music is playing makes it drop the
+        # playback context, which would strand the rest of the queue.
+        self.queue_view(self.tracks)
+        self.app.state.playlist = music.QUEUE
+        self.app.normal_key("D")
+        self.assertEqual(self.sent, [])
+        self.assertIn("while it is playing", self.app.message)
 
     def test_clearing_the_queue_goes_through_the_bus(self):
         self.app.run_command("upnext clear")
@@ -811,10 +825,11 @@ class TestQueueEditing(unittest.TestCase):
     def test_enter_plays_a_queued_track_in_the_queue_playlist(self):
         self.queue_view(self.tracks)
         played = {}
-        self.app.act = lambda fn, *a: played.update(fn=fn.__name__, args=a)
+        self.app.play_in = lambda track, playlist: played.update(
+            track=track, playlist=playlist)
         self.app.activate()
-        self.assertEqual(played["fn"], "play_track_in_playlist")
-        self.assertEqual(played["args"][1], music.QUEUE)
+        self.assertEqual(played["playlist"], music.QUEUE)
+        self.assertEqual(played["track"], self.tracks[0])
 
     def test_enter_on_the_playlist_fallback_uses_that_playlist(self):
         self.app.view = tui.V_QUEUE
@@ -823,9 +838,10 @@ class TestQueueEditing(unittest.TestCase):
         self.app.state.playlist = "Road Trip"
         self.app.lanes["queue"].set_items(self.tracks)
         played = {}
-        self.app.act = lambda fn, *a: played.update(fn=fn.__name__, args=a)
+        self.app.play_in = lambda track, playlist: played.update(
+            track=track, playlist=playlist)
         self.app.activate()
-        self.assertEqual(played["args"][1], "Road Trip")
+        self.assertEqual(played["playlist"], "Road Trip")
 
 
 class TestArtSizing(unittest.TestCase):
@@ -1214,6 +1230,7 @@ class TestQueueHandoff(unittest.TestCase):
         self.addCleanup(self.app.close)
         self.sent = []
         self.app.bus.submit = lambda key, call, then=None: self.sent.append(key)
+        self.app.state.running = True
         self.app._queue_items = [Track(pid="q1", name="Queued", artist="Band")]
         self.playing("Other", remaining=0.5)
 
@@ -1272,17 +1289,45 @@ class TestQueueShuffle(unittest.TestCase):
         self.app = tui.App()
         self.addCleanup(self.app.close)
         self.sent = []
-        self.app.bus.submit = lambda key, call, then=None: self.sent.append(key)
+        self.backs = []
+        def submit(key, call, then=None):
+            self.sent.append(key)
+            self.backs.append(then)
+            return True
+        self.app.bus.submit = submit
+        self.app.state.running = True
         self.app._queue_items = [Track(pid="q1", name="Queued")]
+
+    def settle(self, err=None):
+        """Report the queued jobs as finished, the way the worker would.
+
+        Snapshotted first: a callback may submit further work of its own, and
+        that belongs to the next round rather than this one.
+        """
+        backs, self.backs = self.backs, []
+        for then in backs:
+            if then is not None:
+                then([], err)
 
     def test_starting_the_queue_with_shuffle_on_owes_it_back(self):
         self.app.state.shuffle = True
         self.app.start_queue()
+        self.settle()
         self.assertTrue(self.app._shuffle_restore)
+
+    def test_nothing_is_owed_until_the_queue_has_actually_started(self):
+        # Arming this before the job comes back meant a failed start still put
+        # shuffle on, over a queue that never stood it down.
+        self.app.state.shuffle = True
+        self.app.start_queue()
+        self.assertFalse(self.app._shuffle_restore)
+        self.settle(err=music.MusicError("nope"))
+        self.assertFalse(self.app._shuffle_restore)
 
     def test_with_shuffle_already_off_there_is_nothing_owed(self):
         self.app.state.shuffle = False
         self.app.start_queue()
+        self.settle()
         self.assertFalse(self.app._shuffle_restore)
 
     def test_it_is_not_put_back_while_the_queue_is_still_playing(self):
@@ -1291,13 +1336,14 @@ class TestQueueShuffle(unittest.TestCase):
         self.app.tick_queue()
         self.assertNotIn("reshuffle", self.sent)
 
-    def test_it_is_not_put_back_while_playback_is_stopped(self):
-        # Music refuses property writes with no current playlist, which is
-        # exactly where it lands when the queue runs out.
+    def test_it_is_put_back_even_though_playback_has_stopped(self):
+        # Running out and stopping is the ordinary way for a queue to end, and
+        # holding the write until something plays again left shuffle switched
+        # off for the rest of the session.
         self.app._shuffle_restore = True
         self.app.state.player, self.app.state.playlist = "stopped", ""
         self.app.tick_queue()
-        self.assertNotIn("reshuffle", self.sent)
+        self.assertIn("reshuffle", self.sent)
 
     def test_it_goes_back_once_something_else_is_playing(self):
         self.app._shuffle_restore = True
@@ -1310,6 +1356,29 @@ class TestQueueShuffle(unittest.TestCase):
         self.app.act = lambda fn, *a: None
         self.app.normal_key("s")
         self.assertFalse(self.app._shuffle_restore)
+
+    def test_tries_with_nothing_playing_do_not_use_up_the_budget(self):
+        # Music may refuse the write until something plays again, and a queue
+        # that ran out and sat silent for a minute used to lose shuffle for good.
+        self.app._shuffle_restore = True
+        self.app.state.player, self.app.state.playlist = "stopped", ""
+        for _ in range(self.app.RESTORE_TRIES + 2):
+            self.app._restore_at = 0.0
+            self.app.tick_queue()
+            self.settle(err=music.MusicError("refused"))
+        self.assertTrue(self.app._shuffle_restore)
+        self.assertEqual(self.app._restore_tries, 0)
+
+    def test_with_nothing_playing_the_attempts_are_spaced_out(self):
+        self.app._shuffle_restore = True
+        self.app.state.player, self.app.state.playlist = "stopped", ""
+        self.app.tick_queue()
+        self.settle(err=music.MusicError("refused"))
+        self.sent.clear()
+        self.app.tick_queue()
+        self.assertNotIn("reshuffle", self.sent)
+        self.assertGreater(self.app._restore_at - time.monotonic(),
+                           self.app.RESTORE_IDLE - 1)
 
     def test_it_gives_up_rather_than_retrying_for_ever(self):
         self.app._shuffle_restore = True
@@ -1327,14 +1396,71 @@ class TestQueueDraining(unittest.TestCase):
         self.app = tui.App()
         self.addCleanup(self.app.close)
         self.sent = []
-        self.app.bus.submit = lambda key, call, then=None: self.sent.append(key)
+        self.backs = []
+        def submit(key, call, then=None):
+            self.sent.append(key)
+            self.backs.append(then)
+            return True
+        self.app.bus.submit = submit
+        self.app.state.running = True
 
-    def test_finishing_a_queued_track_drops_it(self):
+    def test_finishing_a_queued_track_notes_it_without_deleting_yet(self):
+        # Deleting here would be deleting out of the playlist Music is playing,
+        # and Music answers that by dropping the playback context - which is
+        # what used to strand the rest of the queue after the very first song.
+        self.app.state.playlist = music.QUEUE
         self.app.on_track_change(before_pid="q1", before_playlist=music.QUEUE)
-        self.assertIn("drain", self.sent)
+        self.assertEqual(self.app._played, ["q1"])
+        self.assertNotIn("drain", self.sent)
 
     def test_finishing_a_track_from_elsewhere_drops_nothing(self):
         self.app.on_track_change(before_pid="x1", before_playlist="Road Trip")
+        self.assertEqual(self.app._played, [])
+        self.assertNotIn("drain", self.sent)
+
+    def test_the_heard_tracks_go_once_playback_has_left_the_queue(self):
+        self.app._played = ["q1"]
+        self.app._queue_items = [Track(pid="q1"), Track(pid="q2")]
+        self.app.state.player, self.app.state.playlist = "playing", "Road Trip"
+        self.app.tick_queue()
+        self.assertIn("drain", self.sent)
+
+    def test_nothing_is_deleted_while_the_queue_is_still_playing(self):
+        self.app._played = ["q1"]
+        self.app.state.player, self.app.state.playlist = "playing", music.QUEUE
+        self.app.tick_queue()
+        self.assertNotIn("drain", self.sent)
+
+    def test_a_heard_track_stops_counting_as_still_to_play(self):
+        # It is still physically in the playlist, but Up Next must not offer it
+        # and the handoff must not think there is something left to hand over to.
+        self.app._queue_items = [Track(pid="q1"), Track(pid="q2")]
+        self.app._played = ["q1"]
+        self.assertEqual([t.pid for t in self.app.pending_queue], ["q2"])
+        self.app._played = ["q1", "q2"]
+        self.assertEqual(self.app.pending_queue, [])
+
+    def test_only_one_copy_is_retired_per_play(self):
+        # Queueing the same song twice and hearing it once leaves one to play.
+        self.app._queue_items = [Track(pid="q1"), Track(pid="q1")]
+        self.app._played = ["q1"]
+        self.assertEqual([t.pid for t in self.app.pending_queue], ["q1"])
+
+    def test_a_drain_already_out_keeps_the_tracks_for_next_time(self):
+        # `submit` drops a key that is still in flight; the pids must not go
+        # with it, or those tracks would replay from the top next time.
+        self.app.bus.submit = lambda key, call, then=None: False
+        self.app._played = ["q1"]
+        self.app.flush_played()
+        self.assertEqual(self.app._played, ["q1"])
+
+    def test_a_failed_drain_is_retried_later_not_every_tick(self):
+        self.app._played = ["q1"]
+        self.app.flush_played()
+        self.backs.pop()(None, music.MusicError("nope"))
+        self.assertEqual(self.app._played, ["q1"])
+        self.sent.clear()
+        self.app.flush_played()
         self.assertNotIn("drain", self.sent)
 
     def test_the_queue_is_re_read_after_every_track_change(self):
@@ -1380,6 +1506,40 @@ class TestPollDoesNotLaunchMusic(unittest.TestCase):
     def test_startup_and_keypresses_may_start_it(self):
         self.poll(force=True)
         self.assertEqual(self.launched, [True])
+
+
+class TestQueueLeavesAQuitMusicAlone(unittest.TestCase):
+    """The queue housekeeping must not reopen Music.app once it is quit.
+
+    Every job it submits goes through `tell`, which launches Music when it is
+    down - so the only safe thing to do with Music quit is submit nothing.
+    """
+
+    def setUp(self):
+        self.app = tui.App()
+        self.addCleanup(self.app.close)
+        self.sent = []
+        self.app.bus.submit = lambda key, call, then=None: self.sent.append(key)
+        self.app.state.running = False      # what `status` reports once quit
+        self.app.state.player, self.app.state.playlist = "stopped", ""
+
+    def test_owed_shuffle_waits_for_music_to_come_back(self):
+        self.app._shuffle_restore = True
+        self.app.tick_queue()
+        self.assertEqual(self.sent, [])
+        self.assertTrue(self.app._shuffle_restore)
+
+    def test_heard_tracks_wait_for_music_to_come_back(self):
+        self.app._played = ["q1"]
+        self.app.tick_queue()
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.app._played, ["q1"])
+
+    def test_quitting_mid_queue_neither_refreshes_nor_retires_the_track(self):
+        # The track vanished because Music did, not because it finished.
+        self.app.on_track_change(before_pid="q1", before_playlist=music.QUEUE)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.app._played, [])
 
 
 class TestIdleCostsNothing(unittest.TestCase):
@@ -1907,6 +2067,239 @@ class TestAccent(unittest.TestCase):
         self.assertEqual(app.tone, fmt.fg(10, 20, 30))
 
 
+class TestPlaylistContext(unittest.TestCase):
+    """Starting a track so that the rest of its playlist follows it.
+
+    Playing a bare track leaves Music with no current playlist, and with no
+    playlist there is nothing for next/previous, shuffle or the media keys to
+    move through - the whole point of the reveal-and-play dance.
+    """
+
+    def setUp(self):
+        self.script = ""
+        self.answer = "true"
+        self._tell = music.tell
+
+        def tell(body, timeout=25.0):
+            self.script = body
+            return self.answer
+        music.tell = tell
+        self.addCleanup(self.restore)
+
+    def restore(self):
+        music.tell = self._tell
+
+    def test_the_selection_is_made_in_the_window_and_played_bare(self):
+        music.play_track_in_playlist("P1", "Road Trip")
+        # The window is pointed at the playlist, the track is selected in it,
+        # and `play` is given nothing to play - so it plays the selection, in
+        # the playlist, rather than the track on its own.
+        self.assertIn('set view of front browser window to p', self.script)
+        self.assertIn("reveal t", self.script)
+        self.assertRegex(self.script, r"reveal t\s*\n\s*delay [\d.]+\s*\n\s*play\b")
+
+    def test_it_stops_first(self):
+        # A bare `play` resumes whatever is current in preference to the
+        # selection, so anything still loaded would win and the reveal be lost.
+        music.play_track_in_playlist("P1", "Road Trip")
+        self.assertLess(self.script.index("stop"), self.script.index("reveal t"))
+
+    def test_it_waits_to_see_the_track_it_asked_for(self):
+        music.play_track_in_playlist("P1", "Road Trip")
+        self.assertIn('if (persistent ID of current track) is "P1"', self.script)
+
+    def test_a_track_that_would_not_go_in_still_plays(self):
+        # Music will not take a selection in the Library's own song list, and a
+        # song that plays alone beats a key that does nothing.
+        music.play_track_in_playlist("P1", "Road Trip")
+        self.assertIn("if not ok then play t", self.script)
+
+    def test_it_reports_whether_the_context_took(self):
+        self.answer = "true"
+        self.assertTrue(music.play_track_in_playlist("P1", "Road Trip"))
+        self.answer = "false"
+        self.assertFalse(music.play_track_in_playlist("P1", "Road Trip"))
+
+    def test_the_library_song_list_is_left_alone(self):
+        # `special kind` is `none` for an ordinary playlist and `Music` for the
+        # library, where revealing selects the right row and `play` starts
+        # somewhere else entirely.
+        music.play_track_in_playlist("P1", "Music")
+        self.assertIn('((special kind of p) as text) is "none"', self.script)
+
+
+class TestSkipKeys(unittest.TestCase):
+    """`n` and `p` when Music has nothing to skip through."""
+
+    def setUp(self):
+        self.app = tui.App()
+        self.addCleanup(self.app.close)
+        self.sent = []
+        self.backs = []
+
+        def submit(key, call, then=None):
+            self.sent.append(key)
+            self.backs.append(then)
+            return True
+        self.app.bus.submit = submit
+        self.app.state.track = Track(pid="t1", name="Lone Song", duration=200)
+        self.app.state.player = "playing"
+
+    def settle(self, moved, err=None):
+        """Answer the step the way the worker would."""
+        backs, self.backs = self.backs, []
+        for then in backs:
+            if then is not None:
+                then(moved, err)
+
+    def test_n_steps_forward(self):
+        self.app.normal_key("n")
+        self.assertEqual(self.sent[0], "act:next_track")
+
+    def test_p_steps_back(self):
+        self.app.normal_key("p")
+        self.assertEqual(self.sent[0], "act:prev_track")
+
+    def test_a_step_that_moved_says_nothing(self):
+        self.app.normal_key("n")
+        self.settle(True)
+        self.assertNotIn("on its own", self.app.message)
+
+    def test_a_step_that_went_nowhere_says_why(self):
+        # Music answers `next track` with silence here rather than an error,
+        # which is indistinguishable from the key not working at all.
+        self.app.normal_key("n")
+        self.settle(False)
+        self.assertIn("Lone Song", self.app.message)
+        self.assertIn("on its own", self.app.message)
+
+    def test_a_failed_step_reports_the_failure_instead(self):
+        self.app.normal_key("n")
+        self.settle(None, err=music.MusicError("Music.app did not respond in time"))
+        self.assertIn("did not respond", self.app.message)
+
+    def test_the_media_key_aliases_go_the_same_way(self):
+        for key in (">", "ctrl-n"):
+            self.app.normal_key(key)
+        for key in ("<", "ctrl-p"):
+            self.app.normal_key(key)
+        self.assertEqual(self.sent, ["act:next_track"] * 2 + ["act:prev_track"] * 2)
+
+    def test_the_commands_go_the_same_way(self):
+        self.app.run_command("next")
+        self.app.run_command("prev")
+        self.assertEqual(self.sent, ["act:next_track", "act:prev_track"])
+
+
+class TestStepReporting(unittest.TestCase):
+    """`next`/`previous` have to say whether they actually moved."""
+
+    def setUp(self):
+        self.scripts = []
+        self.answers = []
+        self._tell = music.tell
+
+        def tell(body, timeout=25.0):
+            self.scripts.append(body)
+            return self.answers.pop(0) if self.answers else "false"
+        music.tell = tell
+        self.addCleanup(lambda: setattr(music, "tell", self._tell))
+
+    def test_next_watches_for_the_track_to_change(self):
+        self.answers = ["true"]
+        self.assertTrue(music.next_track())
+        script = self.scripts[0]
+        self.assertIn("next track", script)
+        self.assertIn("persistent ID of current track", script)
+
+    def test_next_reports_a_step_that_went_nowhere(self):
+        self.answers = ["false"]
+        self.assertFalse(music.next_track())
+
+    def test_previous_rewinds_without_stepping_back(self):
+        # Well into a track the first press restarts it, which needs no running
+        # order and plainly did something - so no second script runs.
+        self.answers = ["true"]
+        self.assertTrue(music.prev_track())
+        self.assertEqual(len(self.scripts), 1)
+        self.assertIn("set player position to 0", self.scripts[0])
+
+    def test_near_the_start_it_steps_back_and_reports(self):
+        self.answers = ["false", "true"]
+        self.assertTrue(music.prev_track())
+        self.assertEqual(len(self.scripts), 2)
+        self.assertIn("previous track", self.scripts[1])
+
+    def test_a_step_back_with_nowhere_to_go_says_so(self):
+        self.answers = ["false", "false"]
+        self.assertFalse(music.prev_track())
+
+
+class TestUpNextUnderShuffle(unittest.TestCase):
+    """What the panel may claim is coming next, given shuffle."""
+
+    def setUp(self):
+        self.app = tui.App()
+        self.addCleanup(self.app.close)
+        self.tracks = [Track(pid="p%d" % i, name="t%d" % i) for i in range(5)]
+        self.app.state.track = self.tracks[2]
+
+    def test_in_order_it_is_the_rest_of_the_playlist(self):
+        self.app.state.shuffle = False
+        self.assertEqual([t.pid for t in self.app.up_next(self.tracks)],
+                         ["p3", "p4"])
+
+    def test_shuffled_every_other_track_is_a_candidate(self):
+        # Music picks from the whole playlist and does not publish what it
+        # picked, so the tracks above the current one are in the running again.
+        self.app.state.shuffle = True
+        self.assertEqual([t.pid for t in self.app.up_next(self.tracks)],
+                         ["p0", "p1", "p3", "p4"])
+
+    def test_toggling_shuffle_re_reads_the_panel(self):
+        # Without this the list never changes and shuffle looks like it did
+        # nothing at all.
+        sent = []
+        self.app.bus.submit = lambda key, call, then=None: sent.append(key)
+        self.app.view = tui.V_QUEUE
+        state = State()
+        state.running = True
+        state.shuffle = True
+        state.track = self.app.state.track
+        self.app._got_status(state, None)
+        self.assertIn("queue", sent)
+
+    def test_it_is_left_alone_while_the_panel_is_not_up(self):
+        sent = []
+        self.app.bus.submit = lambda key, call, then=None: sent.append(key)
+        self.app.view = tui.V_TRACKS
+        state = State()
+        state.running = True
+        state.shuffle = True
+        state.track = self.app.state.track
+        self.app._got_status(state, None)
+        self.assertNotIn("queue", sent)
+
+
+class TestPlayInFeedback(unittest.TestCase):
+    def setUp(self):
+        self.app = tui.App()
+        self.addCleanup(self.app.close)
+        self.backs = []
+        self.app.bus.submit = lambda key, call, then=None: self.backs.append(then)
+        self.track = Track(pid="p1", name="Lone Song")
+
+    def test_nothing_is_said_when_the_playlist_took(self):
+        self.app.play_in(self.track, "Road Trip")
+        self.backs[0](True, None)
+        self.assertNotIn("on its own", self.app.message)
+
+    def test_a_track_left_on_its_own_says_so(self):
+        self.app.play_in(self.track, "Music")
+        self.backs[0](False, None)
+        self.assertIn("nothing follows it", self.app.message)
+
+
 class TestNothingReachesMusic(unittest.TestCase):
     """Running the tests must never open Music.app."""
 
@@ -1929,3 +2322,7 @@ class TestNothingReachesMusic(unittest.TestCase):
             time.sleep(0.01)
             app.bus.drain()
         self.assertFalse(app.bus.busy, "worker jobs never came back")
+
+
+if __name__ == "__main__":
+    unittest.main()

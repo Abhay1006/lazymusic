@@ -112,7 +112,9 @@ way `?` always has. The left stack keeps playing, searching and browsing while
 they are open.
 
 Highlighting a playlist loads it into the main panel; `enter` there plays the
-playlist from the start, or focus the main panel and pick a single track.
+playlist from the start, or focus the main panel and pick a single track. Either
+way the playlist keeps playing after it: what follows is the rest of that
+playlist, in order, or at random with shuffle on.
 
 `/` forgives: it ignores case and accents and matches every word in any order,
 so `beyonce` finds Beyoncé and `satie gymno` finds Gymnopédie No. 1.
@@ -341,18 +343,18 @@ the current track ends. Firing early rather than reacting late is what makes the
 switch seamless: the last second of the outgoing song is cut, which nobody
 hears, where reacting to the change would leave a gap and a second of the wrong
 track. Once the queue is playing, Music carries on through it natively and the
-handoff stands down. Each track is dropped from the playlist as it finishes, so
-the queue drains as it goes instead of replaying from the top next time.
+handoff stands down. Each track is noted as it finishes and deleted once
+playback has left the queue, so the queue drains as it goes instead of replaying
+from the top next time — deleting sooner is not possible, because editing the
+playlist Music is playing makes it drop the playback context and strand the
+rest.
 
 Two things about that are not obvious. It must be `play playlist`: `current
-playlist` is read-only, and playing a *track* object leaves the previous
-playlist in place, so Music would carry on into that instead of through the
-queue and nothing would drain. And `play playlist` obeys shuffle, which would
-scramble a list whose entire point is its order — so shuffle is switched off for
-the queue and put back once playback has moved on to something else. That last
-step waits for playback to actually be running, because Music refuses property
-writes while it has no current playlist, which is exactly where it lands when
-the queue runs out. Toggling shuffle yourself cancels the obligation.
+playlist` is read-only, and playing a *track* object gives Music no running
+order at all, so nothing would follow the queue's first song. And `play
+playlist` obeys shuffle, which would scramble a list whose entire point is its
+order — so shuffle is switched off for the queue and put back once playback has
+moved on. Toggling shuffle yourself cancels the obligation.
 
 `duplicate` into a playlist preserves a track's persistent ID, so the playing
 marker and removal still match it afterwards; removal is by **position** rather
@@ -361,10 +363,45 @@ obvious thing. Note that `delete (track N of ...)` fails with `-1708` — the
 parenthesised form resolves to an object with no delete handler — while the
 plain command form works.
 
-When the queue is empty, `u` falls back to showing the rest of the playlist the
-current track is playing out of, which is exactly right with shuffle off and a
-guess with it on, so the title says `~shuffled` rather than presenting a
-confidently wrong list.
+When the queue is empty, `u` falls back to the playlist the current track is
+playing out of. With shuffle off that is the tracks below it, in order, and it
+is exactly right. With shuffle on there is no order to show — Music picks from
+the whole playlist and does not publish what it picked — so the panel offers
+every track that is not the one playing, marks the title `(shuffled)` and says
+so above the list. Toggling shuffle visibly changes the list, which is the
+honest answer to the question of what shuffle just did.
+
+**Playing a track is not the same as playing it *somewhere*.** Telling Music to
+`play` a track object plays that track and stops: it leaves the player with no
+running order, and with nothing to move through, `next track`, `previous track`,
+shuffle and the keyboard's own media keys all quietly do nothing. They do not
+fail — there is simply nowhere to go — which is indistinguishable from four
+broken keys.
+
+Music will only build a running order for itself, and the one way to ask it to
+is to make the selection in its own window: point the window at the playlist,
+`reveal` the track — which selects it — and then `play` with *no argument*, so
+it plays the selection inside the playlist. The rest of the list follows, and
+shuffle picks from it. Three things this depends on, each learned the hard way:
+
+* **`stop` first.** A bare `play` resumes whatever is current in preference to
+  the selection, so anything still loaded wins and the reveal is ignored.
+* **A pause after `reveal`.** The selection is made by the window; asking it to
+  play sooner than about half a second later plays nothing at all.
+* **An ordinary playlist.** In the Library's own song list the reveal selects
+  the right row and `play` starts somewhere else entirely, so that case falls
+  back to a plain `play` — one track, on its own.
+
+None of this is checkable in advance, so the track that came up is compared
+against the one asked for and a miss falls back to playing it alone. When it
+does, the panel says the song is playing on its own rather than leaving you to
+discover it when nothing follows.
+
+`current playlist` cannot be used to tell whether there is a running order,
+either: after a bare `play` it still names the library while refusing to move
+within it. So `n` and `p` report from the step itself — the track is noted, the
+step is taken, and if nothing moved within a second the key says why instead of
+looking broken.
 
 **Music.app lies about property writes.** `set shuffle enabled to true` returns
 success and leaves the value at `false` whenever the playback engine has wedged
