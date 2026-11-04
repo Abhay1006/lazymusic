@@ -485,6 +485,10 @@ class App:
         self.bus = Bus()
 
     def close(self):
+        pictures = [v for v in self._art.values() if isinstance(v, art.Picture)]
+        if pictures:
+            sys.stdout.write("".join(art.image_delete(v.image_id) for v in pictures))
+            sys.stdout.flush()
         shutil.rmtree(self._scratch, ignore_errors=True)
 
     # ------------------------------------------------------------ state ----
@@ -762,6 +766,8 @@ class App:
             if value is None:
                 return
             cover, colour = value
+            if isinstance(cover, art.Picture):
+                self.show_picture(pid, cover)
             self._art[key] = cover
             self._trim(self._art)
             if pid not in self._accent or colour:
@@ -769,6 +775,21 @@ class App:
                 self._trim(self._accent)
 
         self.bus.submit("art:%d" % rows, job, done)
+
+    def show_picture(self, pid, cover):
+        """Send a kitty cover to the terminal, and free the ones it replaces.
+
+        Written straight out rather than through a frame, since it is not a
+        row of the screen; it lands before the frame that first shows the
+        placeholders. Only the playing track's pictures are kept, at whatever
+        sizes the panels asked for.
+        """
+        out = [cover.upload]
+        for old in [k for k, v in self._art.items()
+                    if isinstance(v, art.Picture) and k[0] != pid]:
+            out.append(art.image_delete(self._art.pop(old).image_id))
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
 
     def want_lyrics(self):
         track = self.state.track
@@ -1485,6 +1506,8 @@ class App:
                      (" · ", "muted"), (":art quad", "focus"),
                      (" · ", "muted"), (":art sext", "focus"),
                      (" · ", "muted"), (":art oct", "focus")])
+        body.append([("  or ", "muted"), (":art kitty", "focus"),
+                     (" for the real picture in Ghostty or kitty", "muted")])
         body.append([("  then ", "muted"), ("a", "bold"),
                      (" shows the cover; LAZYMUSIC_ART_GLYPH makes it stick",
                       "muted")])
@@ -2249,6 +2272,8 @@ class App:
     def cmd_art(self, rest):
         """`:art` shows the cover; `:art half` / `:art oct` picks the glyph.
 
+        `:art kitty` draws the picture itself, for terminals that can.
+
         Octants pack four times the pixels into a cell but are Unicode 16, so a
         terminal that has not caught up draws them as empty boxes. Switching is
         a command rather than a setting so you can see the difference at once.
@@ -2261,7 +2286,7 @@ class App:
         if arg:
             if not art.set_glyph(arg):
                 self.notify("art glyph must be one of: %s  (try :art test)"
-                            % ", ".join(art.GLYPH_ORDER))
+                            % ", ".join(art.GLYPH_ORDER + (art.IMAGE,)))
                 return
             self._glyph_sample = False
             self.notify("cover glyph: %s" % art.glyph_mode())

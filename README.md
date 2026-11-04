@@ -137,6 +137,7 @@ so `beyonce` finds Beyoncé and `satie gymno` finds Gymnopédie No. 1.
 | `:art` · `:lyrics` · `:upnext` | the main-panel views (`:tracks` goes back) |
 | `:art test` | show every glyph family; see which your terminal draws |
 | `:art half` · `quad` · `sext` · `oct` | cover glyph: 2, 4, 6 or 8 pixels per cell |
+| `:art kitty` | the real cover picture, in Ghostty or kitty |
 | `:upnext play` · `:upnext clear` | start the queue now; empty it (`:add` queues the selection) |
 | `:sleep 30` · `:sleep off` | pause in 30 minutes; cancel (bare `:sleep` shows what is left) |
 | `:offset +0.5` · `:offset` | lyrics half a second later, for a transcript that runs early; reset |
@@ -358,6 +359,21 @@ Alacritty 0.17 references all three ranges and still shows octants as question
 marks.) The default is therefore `quad`, which every terminal can draw, and
 `:art test` puts all four families on screen so you can see which yours has.
 `:art sext` switches at runtime; `LAZYMUSIC_ART_GLYPH=sext` makes it stick.
+
+**In Ghostty or kitty the cover is the real picture.** Those terminals speak
+the kitty graphics protocol, so the artwork is sent once per track as a PNG and
+the glyphs above become the fallback. It is shown through Unicode placeholders
+(`U+10EEEE` plus a row and a column diacritic, coloured with the image ID)
+rather than pinned to a screen position, which is what lets it survive tmux:
+tmux moves and redraws placeholders like any text. Under tmux it needs
+
+```
+set -g allow-passthrough on
+```
+
+and lazymusic checks for that, and for the attached client being Ghostty or
+kitty, before choosing it. `:art quad` goes back to blocks;
+`LAZYMUSIC_ART_GLYPH=kitty` or `=quad` overrides the detection.
 
 **Music.app has no queue, so lazymusic keeps one as a playlist.** There is no
 `up next` anywhere in its scripting dictionary, so nothing can read or write the

@@ -37,6 +37,9 @@ def setUpModule():
     _unpatched.append((osa.run, music.launch))
     osa.run = blocked
     music.launch = blocked
+    # Covers are drawn in blocks whatever terminal runs the tests, so a frame
+    # never depends on asking tmux who is attached.
+    art._images = False
 
 
 def tearDownModule():
@@ -1011,6 +1014,7 @@ class TestOctantRows(unittest.TestCase):
     def test_the_glyph_mode_can_be_chosen_by_environment(self):
         saved = os.environ.get("LAZYMUSIC_ART_GLYPH")
         art.set_glyph(None)            # a runtime choice outranks the environment
+        saved_images, art._images = art._images, False   # not whatever runs the tests
         try:
             os.environ["LAZYMUSIC_ART_GLYPH"] = "half"
             self.assertEqual(art.glyph_mode(), "half")
@@ -1018,10 +1022,59 @@ class TestOctantRows(unittest.TestCase):
             self.assertEqual(art.glyph_mode(), art.DEFAULT_GLYPH)
             os.environ.pop("LAZYMUSIC_ART_GLYPH")
             self.assertEqual(art.glyph_mode(), art.DEFAULT_GLYPH)
+            art._images = True
+            self.assertEqual(art.glyph_mode(), art.IMAGE)
+            os.environ["LAZYMUSIC_ART_GLYPH"] = "quad"
+            self.assertEqual(art.glyph_mode(), "quad")
         finally:
+            art._images = saved_images
             os.environ.pop("LAZYMUSIC_ART_GLYPH", None)
             if saved is not None:
                 os.environ["LAZYMUSIC_ART_GLYPH"] = saved
+
+
+class TestKittyImages(unittest.TestCase):
+    """The real-picture path: placeholders, uploads and the tmux wrapper."""
+
+    def test_placeholders_name_the_image_row_and_column(self):
+        rows = art.placeholder_rows(0x010203, 3, 2)
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(r.cols == 3 for r in rows))
+        self.assertTrue(rows[0].startswith("\033[38;2;1;2;3m"))
+        d = art.DIACRITICS
+        self.assertIn(art.PLACEHOLDER + d[1] + d[2], rows[1])
+        self.assertEqual(rows[1].count(art.PLACEHOLDER), 3)
+
+    def test_upload_is_chunked_and_only_the_last_chunk_ends_it(self):
+        saved = os.environ.pop("TMUX", None)
+        try:
+            out = art.image_upload(b"x" * 5000, 7, 4, 2)
+        finally:
+            if saved is not None:
+                os.environ["TMUX"] = saved
+        escapes = out.split("\033\\")[:-1]
+        self.assertEqual(len(escapes), 2)       # 5000 bytes is 6668 in base64
+        self.assertIn("a=T,U=1,f=100,q=2,i=7,c=4,r=2,m=1;", escapes[0])
+        self.assertIn("q=2,m=0;", escapes[1])
+        self.assertNotIn("i=7", escapes[1])
+
+    def test_tmux_gets_the_escape_wrapped_with_its_escapes_doubled(self):
+        saved = os.environ.get("TMUX")
+        os.environ["TMUX"] = "/tmp/tmux-1/default,1,0"
+        try:
+            wrapped = art.image_delete(9)
+        finally:
+            if saved is None:
+                os.environ.pop("TMUX")
+            else:
+                os.environ["TMUX"] = saved
+        self.assertTrue(wrapped.startswith("\033Ptmux;\033\033_Ga=d,d=I,i=9"))
+        self.assertTrue(wrapped.endswith("\033\033\\\033\\"))
+
+    def test_image_ids_are_never_zero_and_fit_a_colour(self):
+        ids = {art.new_image_id() for _ in range(5000)}
+        self.assertNotIn(0, ids)
+        self.assertTrue(all(0 < i <= 0xFFFFFF for i in ids))
 
 
 class TestHelpSheet(unittest.TestCase):

@@ -18,8 +18,13 @@ Decoding is handed to `sips`, which ships with macOS. It downsamples the cover
 to exactly the pixel grid wanted and re-encodes it as a 24-bit BMP - a format
 with no compression to undo, so reading it back is a header and a byte loop
 rather than a dependency on Pillow.
+
+Ghostty and kitty can do better than any glyph: they draw the cover itself,
+through the kitty graphics protocol. Where one of those is in front, that is
+what `glyph_mode` picks, and the blocks are the fallback for everything else.
 """
 
+import base64
 import colorsys
 import os
 import struct
@@ -48,7 +53,29 @@ GLYPH_ORDER = ("half", "quad", "sext", "oct")
 DEFAULT_GLYPH = "quad"
 
 
+# The real picture, for terminals that speak the kitty graphics protocol. tmux
+# would scramble an image pinned to a screen position, so the cover is sent as
+# a virtual placement and shown through Unicode placeholders instead: ordinary
+# one-column characters whose colour names the image and whose two diacritics
+# name the row and column of it they stand for. tmux moves, clips and redraws
+# those like any text, and the terminal paints that slice of the cover in each.
+IMAGE = "kitty"
+IMAGE_TERMS = ("xterm-ghostty", "xterm-kitty")
+PLACEHOLDER = "\U0010EEEE"
+# Row/column numbers 0-63, in the order of kitty's rowcolumn-diacritics.txt.
+DIACRITICS = ("\u0305\u030d\u030e\u0310\u0312\u033d\u033e\u033f\u0346\u034a"
+              "\u034b\u034c\u0350\u0351\u0352\u0357\u035b\u0363\u0364\u0365"
+              "\u0366\u0367\u0368\u0369\u036a\u036b\u036c\u036d\u036e\u036f"
+              "\u0483\u0484\u0485\u0486\u0487\u0592\u0593\u0594\u0595\u0597"
+              "\u0598\u0599\u059c\u059d\u059e\u059f\u05a0\u05a1\u05a8\u05a9"
+              "\u05ab\u05ac\u05af\u05c4\u0610\u0611\u0612\u0613\u0614\u0615"
+              "\u0616\u0617\u0657\u0658")
+IMAGE_PX = 48        # pixels sent per text row - sharp on a retina cell, quick to send
+CHUNK = 4096         # the protocol's limit on base64 bytes per escape
+
 _override = None
+_images = None       # whether the terminal draws kitty images; asked once
+_last_id = 0
 
 
 def glyph_table(mode):
@@ -66,23 +93,52 @@ def set_glyph(mode):
     if mode is None:
         _override = None
         return True
-    if mode not in GLYPH_CELLS:
+    if mode not in GLYPH_CELLS and mode != IMAGE:
         return False
     _override = mode
     return True
 
 
 def glyph_mode():
-    """Which block glyph to draw with.
+    """What to draw covers with: IMAGE, or one of the block glyph families.
 
-    `half` is the fallback for terminals that leave the Unicode 16 octants as
-    empty boxes; `:art half` switches at runtime and LAZYMUSIC_ART_GLYPH sets
-    it at startup.
+    The real picture wherever the terminal can show it, else `quad`. `half` is
+    the fallback for terminals that leave the Unicode 16 octants as empty boxes;
+    `:art half` switches at runtime and LAZYMUSIC_ART_GLYPH sets it at startup.
     """
     if _override:
         return _override
     want = os.environ.get("LAZYMUSIC_ART_GLYPH", "").strip().lower()
-    return want if want in GLYPH_CELLS else DEFAULT_GLYPH
+    if want in GLYPH_CELLS or want == IMAGE:
+        return want
+    return IMAGE if images_supported() else DEFAULT_GLYPH
+
+
+def images_supported():
+    """Whether the terminal in front draws kitty images through placeholders.
+
+    Outside tmux TERM says so. Inside it TERM is tmux's own, so tmux is asked
+    which terminal the client attached from, and whether passthrough is on -
+    without it tmux swallows the picture and leaves the placeholders as junk.
+    """
+    global _images
+    if _images is None:
+        if os.environ.get("TMUX"):
+            _images = (_tmux("display-message", "-p", "#{client_termname}")
+                       in IMAGE_TERMS
+                       and _tmux("show-options", "-gv", "allow-passthrough")
+                       in ("on", "all"))
+        else:
+            _images = os.environ.get("TERM", "") in IMAGE_TERMS
+    return _images
+
+
+def _tmux(*args):
+    try:
+        p = subprocess.run(("tmux",) + args, capture_output=True, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return p.stdout.decode("utf-8", "replace").strip()
 
 
 # Glyphs indexed by a bit pattern; bit i is subcell i, counting left to right
@@ -120,6 +176,18 @@ def to_bmp(src, dst, pixel_w, pixel_h):
         p = subprocess.run(
             ["sips", "-s", "format", "bmp", "-z", str(pixel_h), str(pixel_w),
              src, "--out", dst],
+            capture_output=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return p.returncode == 0
+
+
+def to_png(src, dst, size):
+    """Resample `src` to a PNG at most `size` pixels on its long side."""
+    try:
+        p = subprocess.run(
+            ["sips", "-s", "format", "png", "-Z", str(size), src, "--out", dst],
             capture_output=True, timeout=15,
         )
     except (OSError, subprocess.SubprocessError):
@@ -285,6 +353,97 @@ def accent(pixels):
     return tuple(int(round(v * 255)) for v in colorsys.hls_to_rgb(h, l, s))
 
 
+class Picture(list):
+    """Placeholder rows for a kitty image, plus what the terminal must be sent.
+
+    `upload` carries the picture itself and has to reach the terminal once,
+    before the rows are first drawn; the rows are then ordinary text and get
+    redrawn and diffed like any other.
+    """
+
+    def __init__(self, rows, image_id, upload):
+        super().__init__(rows)
+        self.image_id = image_id
+        self.upload = upload
+
+
+def passthrough(seq):
+    """Wrap `seq` so tmux hands it to the outer terminal untouched."""
+    if not os.environ.get("TMUX"):
+        return seq
+    return "\033Ptmux;" + seq.replace("\033", "\033\033") + "\033\\"
+
+
+def image_upload(png, image_id, cols, rows):
+    """Escapes that send `png` and place it virtually over `cols` x `rows` cells.
+
+    `q=2` keeps the terminal from answering: there is nobody reading the reply,
+    and it would arrive on stdin looking like keystrokes.
+    """
+    data = base64.standard_b64encode(png).decode("ascii")
+    chunks = [data[i:i + CHUNK] for i in range(0, len(data), CHUNK)] or [""]
+    out = []
+    for i, chunk in enumerate(chunks):
+        more = int(i < len(chunks) - 1)
+        if i == 0:
+            keys = "a=T,U=1,f=100,q=2,i=%d,c=%d,r=%d,m=%d" % (image_id, cols, rows, more)
+        else:
+            keys = "q=2,m=%d" % more
+        out.append(passthrough("\033_G%s;%s\033\\" % (keys, chunk)))
+    return "".join(out)
+
+
+def image_delete(image_id):
+    """The escape that frees image `image_id` in the terminal."""
+    return passthrough("\033_Ga=d,d=I,i=%d,q=2\033\\" % image_id)
+
+
+def placeholder_rows(image_id, cols, rows):
+    """Text rows that show image `image_id`, one placeholder per cell.
+
+    The foreground colour is the image ID in 24 bits. Every cell carries both
+    its diacritics, rather than letting the terminal infer the column from the
+    cell before, because tmux redraws a changed run of cells on its own.
+    """
+    colour = "\033[38;2;%d;%d;%dm" % (image_id >> 16 & 255, image_id >> 8 & 255,
+                                     image_id & 255)
+    return [Raw(colour + "".join(PLACEHOLDER + DIACRITICS[y] + DIACRITICS[x]
+                                 for x in range(cols)) + "\033[0m", cols)
+            for y in range(rows)]
+
+
+def new_image_id():
+    """An image ID unlikely to clash with another lazymusic in another pane.
+
+    The terminal's image store is shared by every pane, so the process ID
+    goes in the top half and a counter in the bottom; never 0, which the
+    protocol reserves.
+    """
+    global _last_id
+    _last_id = _last_id % 0xFFF + 1
+    return (os.getpid() & 0xFFF) << 12 | _last_id
+
+
+def picture(src, rows, scratch):
+    """The cover at `src` as a kitty image `rows` high, plus its accent colour."""
+    cols = rows * 2
+    if cols > len(DIACRITICS):
+        return [], None
+    png = scratch + ".png"
+    if not to_png(src, png, rows * IMAGE_PX):
+        return [], None
+    try:
+        with open(png, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return [], None
+    decoded = load(src, scratch, 24, 24)       # only for the accent colour
+    colour = accent(decoded[2]) if decoded else None
+    image_id = new_image_id()
+    return Picture(placeholder_rows(image_id, cols, rows), image_id,
+                   image_upload(data, image_id, cols, rows)), colour
+
+
 def draw(pixels, width, height, rows, mode):
     """Fold a decoded pixel grid into `rows` text rows in glyph family `mode`."""
     wide, tall, glyphs, swap = glyph_table(mode)
@@ -313,6 +472,8 @@ def cover(src, rows, scratch, glyph=None):
     if not color_enabled():
         return [], None               # a cover in monochrome is just noise
     mode = glyph or glyph_mode()
+    if mode == IMAGE:
+        return picture(src, rows, scratch)
     _cols, (pixel_w, pixel_h) = cell_size(rows, mode)
     decoded = load(src, scratch, pixel_w, pixel_h)
     if decoded is None:
