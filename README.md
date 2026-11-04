@@ -56,6 +56,25 @@ Any directory on your `PATH` works; the launcher resolves symlinks and finds its
 own source tree. The first run makes macOS ask permission to control Music —
 approve it once and you're done.
 
+### Optional: the Swift helper
+
+Every request to Music.app normally starts a new `osascript`, which compiles
+its script from scratch. `lazymusic-helper` is a small Swift program that stays
+running and does the same work in-process, compiling each script once:
+
+```sh
+xcode-select --install     # once, if `swiftc` is missing
+helper/build.sh            # builds helper/build/lazymusic-helper
+mus helper                 # checks it against osascript and times both
+```
+
+lazymusic uses the helper whenever it has been built, and falls back to
+`osascript` if the helper is missing, out of date or keeps failing.
+`LAZYMUSIC_HELPER=0` turns it off. It runs the same AppleScript `osascript`
+would, so it needs no new permissions, and nothing about lazymusic's behaviour
+changes. After pulling a change to `helper/main.swift`, run `helper/build.sh`
+again.
+
 ## Use
 
 ```sh
@@ -201,15 +220,18 @@ roles listed in `ROLES` a `#rrggbb` colour.
 | `mus search <query>` | list matches without playing |
 | `mus list [playlist]` | your playlists, or one playlist's tracks |
 | `mus pl <playlist>` | play a playlist |
+| `mus helper` | is the Swift helper in use, and how much faster than `osascript` |
 
 ## How it works
 
 Music.app exposes a scripting interface; lazymusic drives it through
-`osascript`. That's why there's nothing to install and no API key to configure.
+`osascript`, or through `lazymusic-helper` when that has been built. That's why
+there's nothing to install and no API key to configure.
 
 | File | Role |
 | --- | --- |
 | `lazymusic/osa.py` | runs AppleScript, escapes literals, normalises errors |
+| `helper/main.swift` | the optional helper: runs AppleScript in-process, one per worker thread, JSON lines over stdin/stdout |
 | `lazymusic/music.py` | the vocabulary: play, seek, search, playlists |
 | `lazymusic/cli.py` | argument handling and one-shot output |
 | `lazymusic/tui.py` | the panel UI |

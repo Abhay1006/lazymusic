@@ -1,9 +1,11 @@
 """Command line interface for `lazymusic`."""
 
 import json
+import statistics
 import sys
+import time
 
-from . import music, theme
+from . import music, osa, theme
 from .fmt import c, mmss, truncate
 from .osa import MusicError
 
@@ -23,6 +25,7 @@ USAGE = """lazymusic - control Apple Music from your terminal
   mus search <query>
   mus list [playlist]        list playlists, or one playlist's tracks
   mus pl <playlist>          play a playlist
+  mus helper                 is the Swift helper in use, and how much faster
 
 `mus` is the short alias; `lazymusic` does the same thing.
 """
@@ -112,6 +115,64 @@ def _resolve_and_play(query):
     return 0
 
 
+def _timed(call, rounds):
+    """Median milliseconds per call, and the last answer."""
+    times, out = [], None
+    for _ in range(rounds):
+        t0 = time.perf_counter()
+        out = call()
+        times.append((time.perf_counter() - t0) * 1000)
+    return statistics.median(times), out
+
+
+def _same(a, b, skip=()):
+    """Whether two status answers match, ignoring fields that move on their own."""
+    fa, fb = a.split(osa.SEP), b.split(osa.SEP)
+    return len(fa) == len(fb) and all(
+        x == y for i, (x, y) in enumerate(zip(fa, fb)) if i not in skip)
+
+
+def helper_check(rounds=10):
+    """Say whether lazymusic-helper is in use, check it, and time it."""
+    path = osa.helper_path()
+    if path is None:
+        print(c("lazymusic-helper is not built - everything goes through osascript.", "note"))
+        print(c("   build it with: %s" % osa.HELPER_BUILT.replace("build/lazymusic-helper",
+                                                                   "build.sh"), "muted"))
+        return 1
+    if osa.backend() != "helper":
+        print(c("lazymusic-helper is built but would not start: %s" % path, "error"))
+        print(c("   rebuild it with helper/build.sh, or set LAZYMUSIC_HELPER=0", "muted"))
+        return 1
+    print("%s  %s" % (c("helper", "accent"), path))
+
+    # Nothing here starts Music: measuring a remote control is no reason to
+    # open the app it controls.
+    rows = [("empty script", 'return "ok"', ())]
+    if osa.is_running():
+        rows.append(("status poll", osa.in_music(music._STATUS), (4,)))   # 4: position
+        rows.append(("playlists", osa.in_music(music._PLAYLISTS), ()))
+    ok = True
+    for label, script, skip in rows:
+        h_ms, h_out = _timed(lambda: osa.run(script), rounds)
+        o_ms, o_out = _timed(lambda: osa.run_osascript(script), max(3, rounds // 3))
+        same = _same(h_out, o_out, skip)
+        ok = ok and same
+        print("%s  helper %s · osascript %s  %s" % (
+            label.ljust(13),
+            c("%6.1f ms" % h_ms, "bold"), "%6.1f ms" % o_ms,
+            c("%.0fx faster" % (o_ms / h_ms), "accent") if h_ms > 0 else ""))
+        if not same:
+            print(c("   answers differ:\n   helper    %r\n   osascript %r"
+                    % (h_out[:200], o_out[:200]), "error"))
+    if len(rows) == 1:
+        print(c("Music is not running, so only the empty script was timed.", "muted"))
+    print(c("helper and osascript gave the same answers." if ok
+            else "helper and osascript disagree - please report the lines above.",
+            "muted" if ok else "error"))
+    return 0 if ok else 1
+
+
 def dispatch(argv):
     if not argv:
         from .tui import run_tui
@@ -122,6 +183,9 @@ def dispatch(argv):
     if cmd in ("-h", "--help", "help"):
         print(USAGE)
         return 0
+
+    if cmd == "helper":
+        return helper_check()
 
     if cmd == "status" or cmd == "now":
         print_status(music.status(), as_json="--json" in args)

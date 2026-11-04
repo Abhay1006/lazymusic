@@ -2467,5 +2467,143 @@ class TestThemeCommands(unittest.TestCase):
             self.assertEqual(len(self.app.compose(100, 24)), 24, name)
 
 
+
+# A stand-in for lazymusic-helper that speaks its protocol without AppleScript,
+# so the client can be tested anywhere. What it does depends on the script:
+# "sleep" never answers, "die" exits mid-request, "fail" answers with an error
+# the way the helper words one, and anything else is echoed back.
+FAKE_HELPER = r"""#!%s
+import json, os, sys, time
+sys.stdout.write(json.dumps({"hello": "lazymusic-helper",
+                             "protocol": int(os.environ.get("FAKE_PROTOCOL", "1"))}) + "\n")
+sys.stdout.flush()
+for line in sys.stdin:
+    script = json.loads(line)["script"]
+    if script == "sleep":
+        time.sleep(30)
+    if script == "die":
+        sys.exit(3)
+    if script == "fail":
+        reply = {"ok": False, "error": "Music got an error: Can’t get x. (-10006)",
+                 "code": -10006}
+    else:
+        reply = {"ok": True, "out": "%%s|%%d\n" %% (script, os.getpid())}
+    sys.stdout.write(json.dumps(reply) + "\n")
+    sys.stdout.flush()
+""" % sys.executable
+
+
+class TestHelperClient(unittest.TestCase):
+    """`osa.run` hands scripts to lazymusic-helper when there is one."""
+
+    def setUp(self):
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        self.path = os.path.join(tmp, "lazymusic-helper")
+        with open(self.path, "w") as f:
+            f.write(FAKE_HELPER)
+        os.chmod(self.path, 0o755)
+        saved = {k: os.environ.get(k) for k in ("LAZYMUSIC_HELPER", "FAKE_PROTOCOL")}
+        os.environ["LAZYMUSIC_HELPER"] = self.path
+        os.environ.pop("FAKE_PROTOCOL", None)
+        self.addCleanup(self._restore, saved)
+        self._fresh()
+        self.addCleanup(self._fresh)
+        # setUpModule blocks `osa.run`; these tests drive the real one.
+        self.run_script = _unpatched[0][0]
+
+    def _restore(self, saved):
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _fresh(self):
+        osa._close_helpers()
+        osa._local = threading.local()
+        osa._failures = 0
+
+    def test_scripts_go_to_the_helper_with_the_trailing_newline_gone(self):
+        out = self.run_script('tell application "Music" to «ünïcode» \x1f')
+        self.assertTrue(out.startswith('tell application "Music" to «ünïcode» \x1f|'))
+        self.assertFalse(out.endswith("\n"))
+        self.assertEqual(osa.backend(), "helper")
+
+    def test_one_helper_stays_up_for_every_call_on_a_thread(self):
+        first = self.run_script("a").split("|")[1]
+        second = self.run_script("b").split("|")[1]
+        self.assertEqual(first, second)
+
+    def test_each_thread_gets_its_own_helper(self):
+        here = self.run_script("a").split("|")[1]
+        there = []
+        t = threading.Thread(target=lambda: there.append(self.run_script("a").split("|")[1]))
+        t.start()
+        t.join()
+        self.assertNotEqual(here, there[0])
+
+    def test_errors_read_like_osascript_ones_and_keep_their_number(self):
+        with self.assertRaises(osa.MusicError) as caught:
+            self.run_script("fail")
+        self.assertEqual(str(caught.exception), "Can’t get x. (-10006)")
+        self.assertIn("-10006", str(caught.exception))     # what `seek` looks for
+        self.assertEqual(self.run_script("a").split("|")[0], "a")   # still up
+
+    def test_a_timeout_kills_the_helper_and_the_next_call_starts_another(self):
+        before = self.run_script("a").split("|")[1]
+        t0 = time.monotonic()
+        with self.assertRaises(osa.MusicError) as caught:
+            osa._helper().run("sleep", timeout=0.3)
+        self.assertLess(time.monotonic() - t0, 3)
+        self.assertNotIsInstance(caught.exception, osa.HelperGone)
+        self.assertIn("did not respond", str(caught.exception))
+        after = self.run_script("a").split("|")[1]
+        self.assertNotEqual(before, after)
+        self.assertEqual(osa._failures, 0)          # waiting on Music is no crash
+
+    def test_a_helper_that_dies_mid_script_is_not_retried_through_osascript(self):
+        with self.assertRaises(osa.HelperGone):
+            self.run_script("die")
+        self.assertEqual(self.run_script("a").split("|")[0], "a")
+
+    def test_a_helper_that_keeps_dying_is_given_up_on(self):
+        for _ in range(osa.GIVE_UP_AFTER):
+            with self.assertRaises(osa.HelperGone):
+                self.run_script("die")
+            osa._helper()                   # notices the death
+        self.assertIsNone(osa._helper())
+        self.assertEqual(osa.backend(), "osascript")
+
+    def test_an_out_of_date_helper_is_not_used(self):
+        os.environ["FAKE_PROTOCOL"] = "999"
+        self.assertIsNone(osa._helper())
+
+    def test_it_can_be_turned_off(self):
+        os.environ["LAZYMUSIC_HELPER"] = "0"
+        self.assertIsNone(osa.helper_path())
+        self.assertEqual(osa.backend(), "osascript")
+
+    def test_without_a_build_there_is_no_helper(self):
+        os.environ["LAZYMUSIC_HELPER"] = self.path + ".missing"
+        self.assertIsNone(osa._helper())
+
+    def test_the_build_is_where_build_sh_puts_it(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.assertEqual(osa.HELPER_BUILT,
+                         os.path.join(root, "helper", "build", "lazymusic-helper"))
+        with open(os.path.join(root, "helper", "build.sh")) as f:
+            self.assertIn('"$here/build/lazymusic-helper"', f.read())
+
+    def test_both_kinds_of_error_prefix_are_stripped(self):
+        strip = osa._ERR_PREFIXES.sub
+        self.assertEqual(strip("", "12:40: execution error: Music got an error: Nope. (-1)"),
+                         "Nope. (-1)")
+        self.assertEqual(strip("", "Music got an error: Nope. (-1)"), "Nope. (-1)")
+        self.assertEqual(strip("", "Expected end of line. (-2741)"),
+                         "Expected end of line. (-2741)")
+
+
 if __name__ == "__main__":
     unittest.main()

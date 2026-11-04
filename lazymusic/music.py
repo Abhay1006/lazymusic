@@ -483,6 +483,17 @@ def track_lyrics(pid):
 
 # --------------------------------------------------------------- playlists ----
 
+_PLAYLISTS = (
+    "set AppleScript's text item delimiters to (character id 31)\n"
+    "set ns to (name of every user playlist) as text\n"
+    "set cs to {}\n"
+    "repeat with p in user playlists\n"
+    "    set end of cs to ((count of tracks of p) as text)\n"
+    "end repeat\n"
+    "return ns & (character id 30) & (cs as text)"
+)
+
+
 def playlists():
     """Every user playlist with its track count, in Music's own order.
 
@@ -491,15 +502,7 @@ def playlists():
     list. Twenty-odd round trips still land well under half a second, and this
     runs once at startup.
     """
-    out = tell(
-        "set AppleScript's text item delimiters to (character id 31)\n"
-        "set ns to (name of every user playlist) as text\n"
-        "set cs to {}\n"
-        "repeat with p in user playlists\n"
-        "    set end of cs to ((count of tracks of p) as text)\n"
-        "end repeat\n"
-        "return ns & (character id 30) & (cs as text)"
-    )
+    out = tell(_PLAYLISTS)
     cols = out.split(GROUP)
     if len(cols) < 2 or not cols[0]:
         return []
