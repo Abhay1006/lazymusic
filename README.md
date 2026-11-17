@@ -527,3 +527,7 @@ falls back to LRCLIB). Both are explained under *How it works*.
 python3 -m unittest discover tests   # 223 tests, no Music.app needed
 python3 -m lazymusic status          # run without installing
 ```
+
+## License
+
+[MIT](LICENSE) © 2026 Abhay Pratap Singh
